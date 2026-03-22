@@ -17,6 +17,7 @@ PLATFORMS ?= linux_amd64 linux_arm64
 NPROCS ?= 1
 GO_TEST_PARALLEL := $(shell echo $$(( $(NPROCS) / 2 )))
 GO_STATIC_PACKAGES = $(GO_PROJECT)/cmd/provider
+GO_REQUIRED_VERSION ?= 1.24
 GO_LDFLAGS += -X $(GO_PROJECT)/internal/version.Version=$(VERSION)
 GO_SUBDIRS += cmd internal apis
 GO111MODULE = on
@@ -160,5 +161,8 @@ crossplane.help:
 	@echo "$$CROSSPLANE_MAKE_HELP"
 
 help-special: crossplane.help
+
+vendor: modules.download
+vendor.check: modules.check
 
 .PHONY: crossplane.help help-special
