@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  namespace: team-a
+  name: ssh-credentials
+type: Opaque
+stringData:
+  ssh-privatekey: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    <your-private-key-here>
+    -----END OPENSSH PRIVATE KEY-----
+---
+# Namespaced ProviderConfig - scoped to a single namespace
+apiVersion: k3s.m.crossplane.io/v1alpha1
+kind: ProviderConfig
+metadata:
+  name: ssh-ubuntu
+  namespace: team-a
+spec:
+  username: ubuntu
+  credentials:
+    source: Secret
+    secretRef:
+      namespace: team-a
+      name: ssh-credentials
+      key: ssh-privatekey
+---
+# ClusterProviderConfig - cluster-wide SSH credentials accessible from any namespace
+apiVersion: k3s.m.crossplane.io/v1alpha1
+kind: ClusterProviderConfig
+metadata:
+  name: ssh-ubuntu-global
+spec:
+  username: ubuntu
+  credentials:
+    source: Secret
+    secretRef:
+      namespace: crossplane-system
+      name: ssh-credentials
+      key: ssh-privatekey

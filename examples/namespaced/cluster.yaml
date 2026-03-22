@@ -1,0 +1,17 @@
+apiVersion: k3s.m.crossplane.io/v1alpha1
+kind: Cluster
+metadata:
+  name: my-k3s-cluster
+  namespace: team-a
+spec:
+  forProvider:
+    host: 192.168.1.100
+    port: 22
+    k3sChannel: stable
+    tlsSAN: k3s.example.com
+    disableTraefik: true
+  providerConfigRef:
+    name: ssh-ubuntu
+  writeConnectionSecretToRef:
+    name: k3s-cluster-kubeconfig
+    namespace: team-a

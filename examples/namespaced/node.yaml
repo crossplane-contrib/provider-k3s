@@ -1,0 +1,15 @@
+apiVersion: k3s.m.crossplane.io/v1alpha1
+kind: Node
+metadata:
+  name: worker-1
+  namespace: team-a
+spec:
+  forProvider:
+    host: 192.168.1.101
+    port: 22
+    clusterRef:
+      name: my-k3s-cluster
+    role: agent
+    k3sChannel: stable
+  providerConfigRef:
+    name: ssh-ubuntu
