@@ -34,9 +34,9 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/statemetrics"
 
-	v1alpha1 "github.com/crossplane/provider-k3s/apis/cluster/v1alpha1"
-	sshclient "github.com/crossplane/provider-k3s/internal/clients/ssh"
-	"github.com/crossplane/provider-k3s/internal/k3s"
+	v1alpha1 "github.com/crossplane-contrib/provider-k3s/apis/cluster/v1alpha1"
+	sshclient "github.com/crossplane-contrib/provider-k3s/internal/clients/ssh"
+	"github.com/crossplane-contrib/provider-k3s/internal/k3s"
 )
 
 const (
@@ -130,45 +130,17 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		Port:     cr.Spec.ForProvider.Port,
 		Username: pc.Spec.Username,
 	}
-
-	credStr := string(data)
-	if len(data) > 0 && len(credStr) >= 10 && credStr[:10] == "-----BEGIN" {
-		sshCfg.PrivateKey = data
-	} else {
-		sshCfg.Password = credStr
-	}
+	sshCfg.ConfigureAuth(data)
 
 	sshClient, err := sshclient.NewClient(sshCfg)
 	if err != nil {
 		return nil, errors.Wrap(err, errNewClient)
 	}
 
-	// Resolve Cluster reference to get server host and node token
-	clusterRef := cr.Spec.ForProvider.ClusterRef
-	cluster := &v1alpha1.Cluster{}
-	if err := c.kube.Get(ctx, types.NamespacedName{Name: clusterRef.Name}, cluster); err != nil {
+	serverHost, nodeToken, err := c.resolveClusterInfo(ctx, cr.Spec.ForProvider.ClusterRef.Name)
+	if err != nil {
 		sshClient.Close() //nolint:errcheck
-		return nil, errors.Wrap(err, errGetCluster)
-	}
-
-	serverHost := cluster.Spec.ForProvider.Host
-
-	connSecretRef := cluster.Spec.WriteConnectionSecretToReference
-	if connSecretRef == nil {
-		sshClient.Close() //nolint:errcheck
-		return nil, errors.New(errNoConnSecretRef)
-	}
-
-	connSecret := &corev1.Secret{}
-	if err := c.kube.Get(ctx, types.NamespacedName{Name: connSecretRef.Name, Namespace: cluster.GetNamespace()}, connSecret); err != nil {
-		sshClient.Close() //nolint:errcheck
-		return nil, errors.Wrap(err, errGetConnSecret)
-	}
-
-	nodeToken := string(connSecret.Data["node-token"])
-	if nodeToken == "" {
-		sshClient.Close() //nolint:errcheck
-		return nil, errors.New(errNoNodeToken)
+		return nil, err
 	}
 
 	return &external{
@@ -177,6 +149,30 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		nodeToken:  nodeToken,
 		role:       cr.Spec.ForProvider.Role,
 	}, nil
+}
+
+func (c *connector) resolveClusterInfo(ctx context.Context, clusterName string) (serverHost, nodeToken string, err error) {
+	cluster := &v1alpha1.Cluster{}
+	if err := c.kube.Get(ctx, types.NamespacedName{Name: clusterName}, cluster); err != nil {
+		return "", "", errors.Wrap(err, errGetCluster)
+	}
+
+	connSecretRef := cluster.Spec.WriteConnectionSecretToReference
+	if connSecretRef == nil {
+		return "", "", errors.New(errNoConnSecretRef)
+	}
+
+	connSecret := &corev1.Secret{}
+	if err := c.kube.Get(ctx, types.NamespacedName{Name: connSecretRef.Name, Namespace: cluster.GetNamespace()}, connSecret); err != nil {
+		return "", "", errors.Wrap(err, errGetConnSecret)
+	}
+
+	token := string(connSecret.Data["node-token"])
+	if token == "" {
+		return "", "", errors.New(errNoNodeToken)
+	}
+
+	return cluster.Spec.ForProvider.Host, token, nil
 }
 
 type external struct {
@@ -198,7 +194,10 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}
 
 	stdout, _, err := e.ssh.Execute("systemctl is-active " + service + " 2>/dev/null || echo inactive")
-	if err != nil || stdout != "active" {
+	if err != nil {
+		return managed.ExternalObservation{}, errors.Wrap(err, "cannot check k3s status")
+	}
+	if stdout != "active" {
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 

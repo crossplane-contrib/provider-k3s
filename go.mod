@@ -1,4 +1,4 @@
-module github.com/crossplane/provider-k3s
+module github.com/crossplane-contrib/provider-k3s
 
 go 1.24.0
 

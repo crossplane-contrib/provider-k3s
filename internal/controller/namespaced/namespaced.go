@@ -20,10 +20,10 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/controller"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	namespacedv1alpha1 "github.com/crossplane/provider-k3s/apis/namespaced/v1alpha1"
-	"github.com/crossplane/provider-k3s/internal/controller/namespaced/cluster"
-	"github.com/crossplane/provider-k3s/internal/controller/namespaced/config"
-	"github.com/crossplane/provider-k3s/internal/controller/namespaced/node"
+	namespacedv1alpha1 "github.com/crossplane-contrib/provider-k3s/apis/namespaced/v1alpha1"
+	"github.com/crossplane-contrib/provider-k3s/internal/controller/namespaced/cluster"
+	"github.com/crossplane-contrib/provider-k3s/internal/controller/namespaced/config"
+	"github.com/crossplane-contrib/provider-k3s/internal/controller/namespaced/node"
 )
 
 // Setup creates all namespaced k3s controllers with the supplied logger and adds them to

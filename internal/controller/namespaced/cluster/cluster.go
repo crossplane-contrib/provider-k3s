@@ -34,9 +34,9 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/statemetrics"
 
-	v1alpha1 "github.com/crossplane/provider-k3s/apis/namespaced/v1alpha1"
-	sshclient "github.com/crossplane/provider-k3s/internal/clients/ssh"
-	"github.com/crossplane/provider-k3s/internal/k3s"
+	v1alpha1 "github.com/crossplane-contrib/provider-k3s/apis/namespaced/v1alpha1"
+	sshclient "github.com/crossplane-contrib/provider-k3s/internal/clients/ssh"
+	"github.com/crossplane-contrib/provider-k3s/internal/k3s"
 )
 
 const (
@@ -144,13 +144,7 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		Port:     cr.Spec.ForProvider.Port,
 		Username: pcSpec.Username,
 	}
-
-	credStr := string(data)
-	if len(data) > 0 && len(credStr) >= 10 && credStr[:10] == "-----BEGIN" {
-		sshCfg.PrivateKey = data
-	} else {
-		sshCfg.Password = credStr
-	}
+	sshCfg.ConfigureAuth(data)
 
 	sshClient, err := sshclient.NewClient(sshCfg)
 	if err != nil {
@@ -175,7 +169,10 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}
 
 	stdout, _, err := e.ssh.Execute("systemctl is-active k3s 2>/dev/null || echo inactive")
-	if err != nil || stdout != "active" {
+	if err != nil {
+		return managed.ExternalObservation{}, errors.Wrap(err, "cannot check k3s status")
+	}
+	if stdout != "active" {
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 

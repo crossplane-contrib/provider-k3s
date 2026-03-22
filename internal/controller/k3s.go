@@ -20,8 +20,8 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/controller"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/crossplane/provider-k3s/internal/controller/cluster"
-	"github.com/crossplane/provider-k3s/internal/controller/namespaced"
+	"github.com/crossplane-contrib/provider-k3s/internal/controller/cluster"
+	"github.com/crossplane-contrib/provider-k3s/internal/controller/namespaced"
 )
 
 // Setup creates all K3s controllers (both cluster and namespaced) and adds them to

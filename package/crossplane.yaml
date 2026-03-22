@@ -4,7 +4,7 @@ metadata:
   name: provider-k3s
   annotations:
     meta.crossplane.io/maintainer: Crossplane Maintainers <info@crossplane.io>
-    meta.crossplane.io/source: github.com/crossplane/provider-k3s
+    meta.crossplane.io/source: github.com/crossplane-contrib/provider-k3s
     meta.crossplane.io/license: Apache-2.0
     meta.crossplane.io/description: |
       A Crossplane provider for managing k3s clusters via SSH.

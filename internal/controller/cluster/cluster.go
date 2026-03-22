@@ -20,10 +20,10 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/controller"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	clusterv1alpha1 "github.com/crossplane/provider-k3s/apis/cluster/v1alpha1"
-	"github.com/crossplane/provider-k3s/internal/controller/cluster/cluster"
-	"github.com/crossplane/provider-k3s/internal/controller/cluster/config"
-	"github.com/crossplane/provider-k3s/internal/controller/cluster/node"
+	clusterv1alpha1 "github.com/crossplane-contrib/provider-k3s/apis/cluster/v1alpha1"
+	"github.com/crossplane-contrib/provider-k3s/internal/controller/cluster/cluster"
+	"github.com/crossplane-contrib/provider-k3s/internal/controller/cluster/config"
+	"github.com/crossplane-contrib/provider-k3s/internal/controller/cluster/node"
 )
 
 // Setup creates all cluster-scoped k3s controllers with the supplied logger and adds them to

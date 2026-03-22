@@ -24,7 +24,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/crossplane/provider-k3s/apis/cluster/v1alpha1"
+	"github.com/crossplane-contrib/provider-k3s/apis/cluster/v1alpha1"
 )
 
 // Setup adds a controller that reconciles the cluster-scoped ProviderConfig.

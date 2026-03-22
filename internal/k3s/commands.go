@@ -88,8 +88,10 @@ func JoinCommand(params JoinParams) string {
 	var envParts []string
 
 	// K3S_URL and K3S_TOKEN are required for joining
-	envParts = append(envParts, fmt.Sprintf("K3S_URL='https://%s:6443'", params.ServerHost))
-	envParts = append(envParts, fmt.Sprintf("K3S_TOKEN='%s'", params.NodeToken))
+	envParts = append(envParts,
+		fmt.Sprintf("K3S_URL='https://%s:6443'", params.ServerHost),
+		fmt.Sprintf("K3S_TOKEN='%s'", params.NodeToken),
+	)
 
 	// If joining as an additional server, set INSTALL_K3S_EXEC
 	if params.Role == "server" {

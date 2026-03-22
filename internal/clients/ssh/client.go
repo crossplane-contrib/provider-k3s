@@ -98,6 +98,17 @@ func (c *Client) Execute(cmd string) (stdout, stderr string, err error) {
 	return strings.TrimSpace(stdoutBuf.String()), strings.TrimSpace(stderrBuf.String()), nil
 }
 
+// ConfigureAuth sets the appropriate authentication on the Config
+// based on the credential data. If the data looks like a PEM-encoded
+// private key it is set as PrivateKey, otherwise as Password.
+func (cfg *Config) ConfigureAuth(data []byte) {
+	if bytes.HasPrefix(data, []byte("-----BEGIN")) {
+		cfg.PrivateKey = data
+	} else {
+		cfg.Password = string(data)
+	}
+}
+
 // Close terminates the SSH connection.
 func (c *Client) Close() error {
 	if c.conn != nil {
