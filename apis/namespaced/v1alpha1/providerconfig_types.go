@@ -80,7 +80,9 @@ type ProviderConfigList struct {
 // +kubebuilder:printcolumn:name="RESOURCE-KIND",type="string",JSONPath=".resourceRef.kind"
 // +kubebuilder:printcolumn:name="RESOURCE-NAME",type="string",JSONPath=".resourceRef.name"
 // +kubebuilder:resource:scope=Namespaced,categories={crossplane,provider,k3s}
-// A ProviderConfigUsage indicates that a resource is using a ProviderConfig.
+// A ProviderConfigUsage indicates that a resource is using a ProviderConfig or
+// ClusterProviderConfig. Usages live in the namespace of the managed resource
+// that created them and record the kind of config they reference.
 type ProviderConfigUsage struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
