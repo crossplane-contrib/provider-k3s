@@ -162,7 +162,7 @@ func (c *connector) resolveClusterInfo(ctx context.Context, clusterName string) 
 	}
 
 	connSecret := &corev1.Secret{}
-	if err := c.kube.Get(ctx, types.NamespacedName{Name: connSecretRef.Name, Namespace: cluster.GetNamespace()}, connSecret); err != nil {
+	if err := c.kube.Get(ctx, types.NamespacedName{Name: connSecretRef.Name, Namespace: connSecretRef.Namespace}, connSecret); err != nil {
 		return "", "", errors.Wrap(err, errGetConnSecret)
 	}
 
