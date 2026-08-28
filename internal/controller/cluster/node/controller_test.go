@@ -18,9 +18,11 @@ package node
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	xpv1 "github.com/crossplane/crossplane/apis/v2/core/v2"
+	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -203,5 +205,70 @@ func TestJoinParamsCarriesMutableFieldsAndResolvedIdentity(t *testing.T) {
 	}
 	if got.NodeToken != "the-node-token" {
 		t.Errorf("want the connector-resolved node token, got %q", got.NodeToken)
+	}
+}
+
+// TestObserveMinimalResponse calls Observe against a minimal SSH response:
+// the agent service reports active and nothing else is read from the host.
+// Observe must complete without panicking and return a sane
+// ExternalObservation.
+func TestObserveMinimalResponse(t *testing.T) {
+	host, port := startFakeSSHServer(t, map[string]sshResponse{
+		"systemctl is-active k3s-agent 2>/dev/null || echo inactive": {Stdout: "active"},
+	}, sshResponse{})
+
+	e := &external{
+		ssh:        newTestSSHClient(t, host, port),
+		serverHost: "server.example.com",
+		nodeToken:  "the-node-token",
+		role:       "agent",
+		kube:       newTestKubeClient(),
+	}
+	cr := newNodeCR("test-node", "v1.28.2+k3s1", "")
+
+	obs, err := e.Observe(context.Background(), cr)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if !obs.ResourceExists {
+		t.Error("want ResourceExists true: the agent service reports active")
+	}
+	if obs.ResourceUpToDate {
+		t.Error("want ResourceUpToDate false: no last-applied annotation recorded yet")
+	}
+	if !cr.Status.AtProvider.Ready {
+		t.Error("want Ready true once the agent service reports active")
+	}
+	if cr.Status.AtProvider.Role != "agent" {
+		t.Errorf("want Role %q recorded in atProvider, got %q", "agent", cr.Status.AtProvider.Role)
+	}
+}
+
+// TestDeleteServerError proves an uninstall failure on the host is surfaced
+// as a wrapped error from Delete, not swallowed or panicked.
+func TestDeleteServerError(t *testing.T) {
+	host, port := startFakeSSHServer(t, nil, sshResponse{
+		Stderr:   "k3s-agent-uninstall.sh: command not found",
+		ExitCode: 1,
+	})
+
+	e := &external{
+		ssh:        newTestSSHClient(t, host, port),
+		serverHost: "server.example.com",
+		nodeToken:  "the-node-token",
+		role:       "agent",
+		kube:       newTestKubeClient(),
+	}
+	cr := newNodeCR("test-node", "v1.28.2+k3s1", "")
+
+	_, err := e.Delete(context.Background(), cr)
+	if err == nil {
+		t.Fatal("want an error when the uninstall command fails on the host")
+	}
+	if !strings.Contains(err.Error(), "cannot uninstall k3s") {
+		t.Errorf("want the error wrapped with its Delete-path context, got %q", err.Error())
+	}
+	if errors.Unwrap(err) == nil {
+		t.Error("want the error wrapped via errors.Wrap, got an unwrapped error")
 	}
 }

@@ -18,8 +18,10 @@ package cluster
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -208,5 +210,69 @@ func TestInstallParamsCarriesMutableFields(t *testing.T) {
 	}
 	if got.ExtraArgs != "--node-label env=prod" {
 		t.Errorf("want extraArgs carried through, got %q", got.ExtraArgs)
+	}
+}
+
+// TestNamespacedObserveMinimalResponse calls Observe against a minimal SSH
+// response: k3s reports active, but the version, node-token and kubeconfig
+// reads all come back empty -- the way they would on a host where sudo
+// access is unavailable or those files don't exist yet. Observe must
+// complete without panicking on any of the zero-valued reads and must
+// return a sane ExternalObservation.
+func TestNamespacedObserveMinimalResponse(t *testing.T) {
+	host, port := startFakeSSHServer(t, map[string]sshResponse{
+		"systemctl is-active k3s 2>/dev/null || echo inactive": {Stdout: "active"},
+	}, sshResponse{}) // fallback: empty stdout, exit 0 -- covers version/node-token/kubeconfig reads
+
+	e := &external{ssh: newTestSSHClient(t, host, port), host: host, kube: newTestKubeClient()}
+	cr := newClusterCR("test-cluster", "v1.28.2+k3s1", "")
+
+	obs, err := e.Observe(context.Background(), cr)
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if !obs.ResourceExists {
+		t.Error("want ResourceExists true: k3s reports active")
+	}
+	if obs.ResourceUpToDate {
+		t.Error("want ResourceUpToDate false: no last-applied annotation recorded yet")
+	}
+	if cr.Status.AtProvider.K3sVersion != "" {
+		t.Errorf("want empty K3sVersion from a minimal response, got %q", cr.Status.AtProvider.K3sVersion)
+	}
+	if !cr.Status.AtProvider.Ready {
+		t.Error("want Ready true once k3s reports active")
+	}
+	if _, ok := obs.ConnectionDetails["kubeconfig"]; ok {
+		t.Error("want no kubeconfig connection detail from an empty kubeconfig read")
+	}
+	if _, ok := obs.ConnectionDetails["node-token"]; ok {
+		t.Error("want no node-token connection detail from an empty node-token read")
+	}
+	if _, ok := obs.ConnectionDetails["endpoint"]; !ok {
+		t.Error("want the endpoint connection detail always present")
+	}
+}
+
+// TestNamespacedDeleteServerError proves an uninstall failure on the host is
+// surfaced as a wrapped error from Delete, not swallowed or panicked.
+func TestNamespacedDeleteServerError(t *testing.T) {
+	host, port := startFakeSSHServer(t, nil, sshResponse{
+		Stderr:   "k3s-uninstall.sh: command not found",
+		ExitCode: 1,
+	})
+
+	e := &external{ssh: newTestSSHClient(t, host, port), host: host, kube: newTestKubeClient()}
+	cr := newClusterCR("test-cluster", "v1.28.2+k3s1", "")
+
+	_, err := e.Delete(context.Background(), cr)
+	if err == nil {
+		t.Fatal("want an error when the uninstall command fails on the host")
+	}
+	if !strings.Contains(err.Error(), "cannot uninstall k3s") {
+		t.Errorf("want the error wrapped with its Delete-path context, got %q", err.Error())
+	}
+	if errors.Unwrap(err) == nil {
+		t.Error("want the error wrapped via errors.Wrap, got an unwrapped error")
 	}
 }
