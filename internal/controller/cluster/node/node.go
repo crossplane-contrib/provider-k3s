@@ -18,11 +18,15 @@ package node
 
 import (
 	"context"
+	"encoding/json"
+	"reflect"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/feature"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -36,30 +40,37 @@ import (
 
 	v1alpha1 "github.com/crossplane-contrib/provider-k3s/apis/cluster/v1alpha1"
 	sshclient "github.com/crossplane-contrib/provider-k3s/internal/clients/ssh"
+	"github.com/crossplane-contrib/provider-k3s/internal/driftdetection"
 	"github.com/crossplane-contrib/provider-k3s/internal/k3s"
 )
 
 const (
-	errNotNode         = "managed resource is not a Node custom resource"
-	errTrackPCUsage    = "cannot track ProviderConfig usage"
-	errGetPC           = "cannot get ProviderConfig"
-	errGetCreds        = "cannot get credentials"
-	errNewClient       = "cannot create SSH client"
-	errGetCluster      = "cannot get referenced Cluster"
-	errGetConnSecret   = "cannot get Cluster's connection secret"
-	errNoNodeToken     = "Cluster connection secret has no node-token key"
-	errNoConnSecretRef = "referenced Cluster has no writeConnectionSecretToRef"
+	errTrackPCUsage         = "cannot track ProviderConfig usage"
+	errGetPC                = "cannot get ProviderConfig"
+	errGetCreds             = "cannot get credentials"
+	errNewClient            = "cannot create SSH client"
+	errGetCluster           = "cannot get referenced Cluster"
+	errGetConnSecret        = "cannot get Cluster's connection secret"
+	errNoNodeToken          = "Cluster connection secret has no node-token key"
+	errNoConnSecretRef      = "referenced Cluster has no writeConnectionSecretToRef"
+	errMarshalLastApplied   = "cannot marshal last-applied configuration"
+	errUnmarshalLastApplied = "cannot unmarshal last-applied configuration"
 )
+
+// annotationLastAppliedConfig records the mutable NodeParameters this
+// controller last sent to the host, so Observe can detect drift even though
+// the k3s join script does not return the server's own configuration.
+const annotationLastAppliedConfig = "k3s.crossplane.io/last-applied-node-config"
 
 // Setup adds a controller that reconciles cluster-scoped Node managed resources.
 func Setup(mgr ctrl.Manager, o controller.Options) error {
 	name := managed.ControllerName(v1alpha1.NodeGroupKind)
 
 	opts := []managed.ReconcilerOption{
-		managed.WithExternalConnector(&connector{
+		managed.WithTypedExternalConnector[*v1alpha1.Node](driftdetection.WrapConnector[*v1alpha1.Node](&connector{
 			kube:  mgr.GetClient(),
 			usage: resource.NewLegacyProviderConfigUsageTracker(mgr.GetClient(), &v1alpha1.ProviderConfigUsage{}),
-		}),
+		})),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))), //nolint:staticcheck // event.NewAPIRecorder still requires the legacy record.EventRecorder.
@@ -101,12 +112,7 @@ type connector struct {
 	usage *resource.LegacyProviderConfigUsageTracker
 }
 
-func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) {
-	cr, ok := mg.(*v1alpha1.Node)
-	if !ok {
-		return nil, errors.New(errNotNode)
-	}
-
+func (c *connector) Connect(ctx context.Context, cr *v1alpha1.Node) (managed.TypedExternalClient[*v1alpha1.Node], error) {
 	if err := c.usage.Track(ctx, cr); err != nil {
 		return nil, errors.Wrap(err, errTrackPCUsage)
 	}
@@ -147,6 +153,7 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 		serverHost: serverHost,
 		nodeToken:  nodeToken,
 		role:       cr.Spec.ForProvider.Role,
+		kube:       c.kube,
 	}, nil
 }
 
@@ -179,14 +186,15 @@ type external struct {
 	serverHost string
 	nodeToken  string
 	role       string
+	// kube writes the last-applied-config annotation directly to the API
+	// server from Update(). crossplane-runtime does not persist an in-memory
+	// annotation mutation made inside external.Update() -- only the status
+	// subresource is written back after a successful Update -- so relying on
+	// the reconciler here would silently discard the annotation forever.
+	kube client.Client
 }
 
-func (e *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
-	cr, ok := mg.(*v1alpha1.Node)
-	if !ok {
-		return managed.ExternalObservation{}, errors.New(errNotNode)
-	}
-
+func (e *external) Observe(ctx context.Context, cr *v1alpha1.Node) (managed.ExternalObservation, error) {
 	service := "k3s-agent"
 	if e.role == "server" {
 		service = "k3s"
@@ -204,48 +212,82 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	cr.Status.AtProvider.Role = e.role
 	cr.SetConditions(xpv1.Available())
 
+	upToDate, err := nodeIsUpToDate(cr)
+	if err != nil {
+		return managed.ExternalObservation{}, err
+	}
+
 	return managed.ExternalObservation{
 		ResourceExists:   true,
-		ResourceUpToDate: true,
+		ResourceUpToDate: upToDate,
+		// No server-defaulted spec fields to backfill: port and k3sChannel
+		// already carry kubebuilder defaults the API server fills in before
+		// this controller ever observes the resource, and the k3s join
+		// script returns no other configuration this provider could adopt
+		// into spec.
+		ResourceLateInitialized: false,
 	}, nil
 }
 
-func (e *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
-	cr, ok := mg.(*v1alpha1.Node)
-	if !ok {
-		return managed.ExternalCreation{}, errors.New(errNotNode)
-	}
-
+func (e *external) Create(ctx context.Context, cr *v1alpha1.Node) (managed.ExternalCreation, error) {
 	cr.SetConditions(xpv1.Creating())
 
-	cmd := k3s.JoinCommand(k3s.JoinParams{
-		ServerHost: e.serverHost,
-		NodeToken:  e.nodeToken,
-		Role:       cr.Spec.ForProvider.Role,
-		K3sVersion: cr.Spec.ForProvider.K3sVersion,
-		K3sChannel: cr.Spec.ForProvider.K3sChannel,
-		ExtraArgs:  cr.Spec.ForProvider.ExtraArgs,
-		TLSSAN:     cr.Spec.ForProvider.TLSSAN,
-	})
+	cmd := k3s.JoinCommand(joinParamsFor(cr.Spec.ForProvider, e.serverHost, e.nodeToken))
 
 	_, stderr, err := e.ssh.Execute(cmd)
 	if err != nil {
 		return managed.ExternalCreation{}, errors.Wrapf(err, "cannot join k3s cluster: %s", stderr)
 	}
 
+	if err := persistLastAppliedNodeConfig(ctx, e.kube, cr); err != nil {
+		return managed.ExternalCreation{}, err
+	}
+
 	return managed.ExternalCreation{}, nil
 }
 
-func (e *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
+// Update re-runs the k3s join script with the resource's current
+// configuration. The join script always rewrites the full systemd unit from
+// the flags it is given and restarts the service, so — like a whole-object
+// PUT — every field is echoed on every call, including the immutable ones
+// (host, port, clusterRef, role): CEL rejects any change to them, so their
+// value here always matches what is already running.
+func (e *external) Update(ctx context.Context, cr *v1alpha1.Node) (managed.ExternalUpdate, error) {
+	cmd := k3s.JoinCommand(joinParamsFor(cr.Spec.ForProvider, e.serverHost, e.nodeToken))
+
+	_, stderr, err := e.ssh.Execute(cmd)
+	if err != nil {
+		return managed.ExternalUpdate{}, errors.Wrapf(err, "cannot reconfigure k3s node: %s", stderr)
+	}
+
+	if err := persistLastAppliedNodeConfig(ctx, e.kube, cr); err != nil {
+		return managed.ExternalUpdate{}, err
+	}
+
 	return managed.ExternalUpdate{}, nil
 }
 
-func (e *external) Delete(ctx context.Context, mg resource.Managed) (managed.ExternalDelete, error) {
-	cr, ok := mg.(*v1alpha1.Node)
-	if !ok {
-		return managed.ExternalDelete{}, errors.New(errNotNode)
+// joinParamsFor builds the FULL k3s join command parameters from the
+// resource's current spec plus the connector-resolved cluster identity. The
+// join script is a whole-object replace, so every field is echoed here,
+// including the immutable ones (role): CEL rejects any change to it on this
+// resource, so its value here always matches what is already running. host,
+// port and clusterRef are not join-script flags at all — host/port address
+// the SSH connection itself, and clusterRef has already been resolved into
+// serverHost/nodeToken by Connect.
+func joinParamsFor(p v1alpha1.NodeParameters, serverHost, nodeToken string) k3s.JoinParams {
+	return k3s.JoinParams{
+		ServerHost: serverHost,
+		NodeToken:  nodeToken,
+		Role:       p.Role,
+		K3sVersion: p.K3sVersion,
+		K3sChannel: p.K3sChannel,
+		ExtraArgs:  p.ExtraArgs,
+		TLSSAN:     p.TLSSAN,
 	}
+}
 
+func (e *external) Delete(ctx context.Context, cr *v1alpha1.Node) (managed.ExternalDelete, error) {
 	cr.SetConditions(xpv1.Deleting())
 
 	var cmd string
@@ -265,4 +307,81 @@ func (e *external) Delete(ctx context.Context, mg resource.Managed) (managed.Ext
 
 func (e *external) Disconnect(ctx context.Context) error {
 	return e.ssh.Close()
+}
+
+// mutableNodeFields is the subset of NodeParameters this controller owns
+// convergence for. host, port, clusterRef and role are immutable (enforced
+// by CEL on the CRD) and excluded here: comparing them would report drift
+// the API can never resolve, and Update would loop forever trying to
+// correct a field it can't change.
+type mutableNodeFields struct {
+	K3sVersion string `json:"k3sVersion"`
+	K3sChannel string `json:"k3sChannel"`
+	ExtraArgs  string `json:"extraArgs"`
+	TLSSAN     string `json:"tlsSAN"`
+}
+
+func mutableNodeFieldsOf(p v1alpha1.NodeParameters) mutableNodeFields {
+	return mutableNodeFields{
+		K3sVersion: p.K3sVersion,
+		K3sChannel: p.K3sChannel,
+		ExtraArgs:  p.ExtraArgs,
+		TLSSAN:     p.TLSSAN,
+	}
+}
+
+// nodeIsUpToDate compares the resource's mutable fields against the
+// configuration this controller last applied. The k3s join script never
+// returns the server's own configuration, so there is nothing to compare
+// spec against directly (convention: last-applied-config annotation
+// pattern). A resource with no recorded annotation — freshly adopted, or
+// created before this annotation existed — is reported as NOT up to date:
+// the join script is safe to re-run with the resource's own declared
+// configuration, and doing so once seeds the annotation.
+func nodeIsUpToDate(cr *v1alpha1.Node) (bool, error) {
+	raw, ok := cr.GetAnnotations()[annotationLastAppliedConfig]
+	if !ok || raw == "" {
+		return false, nil
+	}
+	var last mutableNodeFields
+	if err := json.Unmarshal([]byte(raw), &last); err != nil {
+		return false, errors.Wrap(err, errUnmarshalLastApplied)
+	}
+	return reflect.DeepEqual(last, mutableNodeFieldsOf(cr.Spec.ForProvider)), nil
+}
+
+// persistLastAppliedNodeConfig durably records the mutable configuration
+// this controller just sent to the host, so the next Observe can detect
+// drift. It writes directly to the API server -- retried on conflict --
+// rather than mutating cr in memory and trusting the reconciler to persist
+// it: crossplane-runtime writes back the full object after Create (and
+// after an Observe that reports ResourceLateInitialized), but after a
+// successful Update() it persists ONLY the status subresource. An
+// annotation set inside Update() and left for the reconciler to carry
+// forward is silently discarded, and the comparison it feeds never
+// converges.
+func persistLastAppliedNodeConfig(ctx context.Context, kube client.Client, cr *v1alpha1.Node) error {
+	b, err := json.Marshal(mutableNodeFieldsOf(cr.Spec.ForProvider))
+	if err != nil {
+		return errors.Wrap(err, errMarshalLastApplied)
+	}
+	value := string(b)
+	key := client.ObjectKeyFromObject(cr)
+
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		latest := &v1alpha1.Node{}
+		if err := kube.Get(ctx, key, latest); err != nil {
+			return err
+		}
+		if latest.GetAnnotations()[annotationLastAppliedConfig] != value {
+			meta.AddAnnotations(latest, map[string]string{annotationLastAppliedConfig: value})
+			if err := kube.Update(ctx, latest); err != nil {
+				return err
+			}
+		}
+		// Mirror onto the in-memory object so this reconcile's own view is
+		// current, even though the persisted write came from a fresh copy.
+		meta.AddAnnotations(cr, map[string]string{annotationLastAppliedConfig: value})
+		return nil
+	})
 }

@@ -23,23 +23,40 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	xpv1 "github.com/crossplane/crossplane/apis/v2/core/v2"
+
+	"github.com/crossplane-contrib/provider-k3s/apis/common/driftdetection"
 )
 
 // NodeParameters are the configurable fields of a Node.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.port) || has(self.port)",message="port cannot be removed once set"
 type NodeParameters struct {
-	// Host is the DNS name or IP address of the target machine.
+	// Host is the DNS name or IP address of the target machine. It is the
+	// SSH connection target and the sole identity this provider has for the
+	// joined node; it cannot be changed after creation.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="host is immutable after creation"
 	Host string `json:"host"`
 
-	// Port is the SSH port. Defaults to 22.
+	// Port is the SSH port. Defaults to 22. It addresses the same SSH
+	// connection target as host and cannot be changed after creation.
 	// +optional
 	// +kubebuilder:default=22
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="port is immutable after creation"
 	Port int `json:"port,omitempty"`
 
 	// ClusterRef is a reference to the Cluster resource this node joins.
+	// Changing it after creation would mean leaving one cluster and joining
+	// another, which this provider does not attempt as an in-place update.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="clusterRef is immutable after creation"
 	ClusterRef xpv1.Reference `json:"clusterRef"`
 
 	// Role is the role of this node: "agent" (worker) or "server" (additional control plane).
+	// Switching a joined node's role requires leaving and rejoining, which
+	// this provider does not attempt as an in-place update.
+	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Enum=agent;server
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="role is immutable after creation"
 	Role string `json:"role"`
 
 	// K3sVersion is the specific k3s version to install.
@@ -72,7 +89,15 @@ type NodeObservation struct {
 // A NodeSpec defines the desired state of a Node.
 type NodeSpec struct {
 	xpv1.ClusterManagedResourceSpec `json:",inline"`
-	ForProvider                     NodeParameters `json:"forProvider"`
+
+	// DriftDetection configures which forProvider fields are owned outside
+	// Crossplane and how drift in those fields is detected and corrected.
+	// Absent configuration means drift detection is enabled with no
+	// ignored paths -- today's behaviour.
+	// +optional
+	DriftDetection *driftdetection.DriftDetection `json:"driftDetection,omitempty"`
+
+	ForProvider NodeParameters `json:"forProvider"`
 }
 
 // A NodeStatus represents the observed state of a Node.
