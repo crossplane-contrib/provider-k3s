@@ -4,11 +4,26 @@ metadata:
   name: worker-1
 spec:
   forProvider:
-    host: 192.168.1.101
+    host: k3s-nodepool-1.k3s-nodepool.crossplane-system.svc.cluster.local
     port: 22
     clusterRef:
       name: my-k3s-cluster
     role: agent
     k3sChannel: stable
-  providerConfigRef:
-    name: ssh-ubuntu
+---
+apiVersion: k3s.crossplane.io/v1alpha1
+kind: Cluster
+metadata:
+  name: my-k3s-cluster
+  annotations:
+    uptest.upbound.io/pre-delete-hook: ./testhooks/delete-node.sh
+spec:
+  forProvider:
+    host: k3s-nodepool-0.k3s-nodepool.crossplane-system.svc.cluster.local
+    port: 22
+    k3sChannel: stable
+    tlsSAN: k3s.example.com
+    disableTraefik: true
+  writeConnectionSecretToRef:
+    name: k3s-cluster-kubeconfig
+    namespace: crossplane-system
