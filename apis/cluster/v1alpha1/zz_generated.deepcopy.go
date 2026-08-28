@@ -9,6 +9,7 @@
 package v1alpha1
 
 import (
+	"github.com/crossplane-contrib/provider-k3s/apis/common/driftdetection"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -105,6 +106,11 @@ func (in *ClusterParameters) DeepCopy() *ClusterParameters {
 func (in *ClusterSpec) DeepCopyInto(out *ClusterSpec) {
 	*out = *in
 	in.ClusterManagedResourceSpec.DeepCopyInto(&out.ClusterManagedResourceSpec)
+	if in.DriftDetection != nil {
+		in, out := &in.DriftDetection, &out.DriftDetection
+		*out = new(driftdetection.DriftDetection)
+		(*in).DeepCopyInto(*out)
+	}
 	out.ForProvider = in.ForProvider
 }
 
@@ -229,6 +235,11 @@ func (in *NodeParameters) DeepCopy() *NodeParameters {
 func (in *NodeSpec) DeepCopyInto(out *NodeSpec) {
 	*out = *in
 	in.ClusterManagedResourceSpec.DeepCopyInto(&out.ClusterManagedResourceSpec)
+	if in.DriftDetection != nil {
+		in, out := &in.DriftDetection, &out.DriftDetection
+		*out = new(driftdetection.DriftDetection)
+		(*in).DeepCopyInto(*out)
+	}
 	in.ForProvider.DeepCopyInto(&out.ForProvider)
 }
 

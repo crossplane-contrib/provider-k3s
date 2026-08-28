@@ -143,6 +143,60 @@ resource itself. The ProviderConfig only holds the SSH identity (username +
 credentials), so a single ProviderConfig can be reused across multiple machines
 that share the same SSH user and key.
 
+## Drift Detection
+
+Every `Cluster` and `Node` accepts an optional `spec.driftDetection` block that
+controls how the controller reacts when the live host no longer matches the
+resource's desired configuration:
+
+```yaml
+apiVersion: k3s.crossplane.io/v1alpha1
+kind: Cluster
+metadata:
+  name: my-cluster
+spec:
+  driftDetection:
+    mode: enabled
+    ignore:
+      - paths:
+          - forProvider.k3sVersion
+  forProvider:
+    host: 192.168.1.100
+    port: 22
+    k3sChannel: stable
+  providerConfigRef:
+    name: ssh-ubuntu
+```
+
+`mode` selects the behaviour:
+
+- `enabled` (the default — a resource with no `driftDetection` block behaves
+  exactly as if this were set) — detect drift and correct it by re-running the
+  install/join command with the resource's declared configuration.
+- `warn` — detect drift and report it on the resource's `DriftDetected`
+  condition, but do not correct it.
+- `disabled` — neither detect nor correct drift.
+
+`ignore` lists `forProvider` fields that are owned by something other than
+Crossplane, in Crossplane field path notation (for example
+`forProvider.k3sVersion`) or as a JSON Pointer (`/forProvider/k3sVersion`). An
+ignored field is seeded from `spec` on create, and from then on the value last
+observed on the host is carried forward instead of being overwritten from
+`spec`. Fields the SSH target's own identity is derived from (`host`) can
+never be ignored.
+
+**How drift is measured on this provider.** The k3s install and join scripts
+return no introspectable server configuration — there is nothing to read back
+from the host and compare against `spec` directly. Instead, the controller
+records the mutable configuration it last sent to the host in an annotation
+and compares the resource's current `spec` against that record on every
+reconcile. This means drift detection here only catches configuration that
+diverged from what Crossplane itself last applied — a change made directly on
+the host outside of any k3s reconfiguration this provider performed (for
+example editing a systemd unit or a k3s config file by hand) is **not**
+detected, because the provider never re-reads the host's actual running
+configuration.
+
 ## Acknowledgements
 
 This provider is built on top of the patterns established by

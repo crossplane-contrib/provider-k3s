@@ -71,17 +71,64 @@ spec:
                 - Orphan
                 - Delete
                 type: string
+              driftDetection:
+                description: |-
+                  DriftDetection configures which forProvider fields are owned outside
+                  Crossplane and how drift in those fields is detected and corrected.
+                  Absent configuration means drift detection is enabled with no
+                  ignored paths -- today's behaviour.
+                properties:
+                  ignore:
+                    description: Ignore declares fields owned outside Crossplane.
+                    items:
+                      description: |-
+                        IgnoreRule declares fields whose value is owned by something other than
+                        Crossplane. Listed fields are seeded from spec on create, then neither
+                        compared nor written from spec: the value observed on the external
+                        resource is carried forward instead.
+                      properties:
+                        paths:
+                          description: |-
+                            Paths to ignore, in Crossplane field path notation rooted at the
+                            managed resource spec, for example forProvider.k3sVersion. This is
+                            the grammar Composition patches use; JSON Pointer form
+                            (/forProvider/k3sVersion) is also accepted. List indices and
+                            wildcards are not supported -- ignore the whole list instead.
+                          items:
+                            type: string
+                          type: array
+                      type: object
+                    type: array
+                  mode:
+                    default: enabled
+                    description: Mode selects the drift detection behaviour.
+                    enum:
+                    - enabled
+                    - warn
+                    - disabled
+                    type: string
+                type: object
               forProvider:
                 description: ClusterParameters are the configurable fields of a Cluster.
                 properties:
                   clusterInit:
-                    description: ClusterInit enables embedded etcd for HA multi-server
-                      setup.
+                    description: |-
+                      ClusterInit enables embedded etcd for HA multi-server setup. A running
+                      server cannot be converted between embedded-etcd and non-HA mode in
+                      place, so this is immutable after creation.
                     type: boolean
+                    x-kubernetes-validations:
+                    - message: clusterInit is immutable after creation
+                      rule: self == oldSelf
                   datastoreEndpoint:
-                    description: DatastoreEndpoint is an external datastore URL for
-                      HA (MySQL/PostgreSQL).
+                    description: |-
+                      DatastoreEndpoint is an external datastore URL for HA (MySQL/PostgreSQL).
+                      A running server cannot be re-pointed at a new datastore in place, so
+                      this is immutable after creation.
                     type: string
+                    x-kubernetes-validations:
+                    - message: datastoreEndpoint is immutable after creation
+                      rule: self == oldSelf
                   disableServiceLB:
                     description: DisableServiceLB disables the default ServiceLB load
                       balancer.
@@ -95,9 +142,14 @@ spec:
                       server.
                     type: string
                   host:
-                    description: Host is the DNS name or IP address of the target
-                      machine.
+                    description: |-
+                      Host is the DNS name or IP address of the target machine. It is the
+                      SSH connection target and the sole identity this provider has for the
+                      installed server; it cannot be changed after creation.
                     type: string
+                    x-kubernetes-validations:
+                    - message: host is immutable after creation
+                      rule: self == oldSelf
                   k3sChannel:
                     default: stable
                     description: K3sChannel is the release channel (stable, latest,
@@ -109,8 +161,13 @@ spec:
                     type: string
                   port:
                     default: 22
-                    description: Port is the SSH port. Defaults to 22.
+                    description: |-
+                      Port is the SSH port. Defaults to 22. It addresses the same SSH
+                      connection target as host and cannot be changed after creation.
                     type: integer
+                    x-kubernetes-validations:
+                    - message: port is immutable after creation
+                      rule: self == oldSelf
                   tlsSAN:
                     description: TLSSAN adds an additional hostname or IP as a TLS
                       Subject Alternative Name.
@@ -118,6 +175,13 @@ spec:
                 required:
                 - host
                 type: object
+                x-kubernetes-validations:
+                - message: port cannot be removed once set
+                  rule: '!has(oldSelf.port) || has(self.port)'
+                - message: clusterInit cannot be removed once set
+                  rule: '!has(oldSelf.clusterInit) || has(self.clusterInit)'
+                - message: datastoreEndpoint cannot be removed once set
+                  rule: '!has(oldSelf.datastoreEndpoint) || has(self.datastoreEndpoint)'
               managementPolicies:
                 default:
                 - '*'

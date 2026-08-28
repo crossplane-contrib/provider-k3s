@@ -18,11 +18,15 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"reflect"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/feature"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -36,26 +40,33 @@ import (
 
 	v1alpha1 "github.com/crossplane-contrib/provider-k3s/apis/cluster/v1alpha1"
 	sshclient "github.com/crossplane-contrib/provider-k3s/internal/clients/ssh"
+	"github.com/crossplane-contrib/provider-k3s/internal/driftdetection"
 	"github.com/crossplane-contrib/provider-k3s/internal/k3s"
 )
 
 const (
-	errNotCluster   = "managed resource is not a Cluster custom resource"
-	errTrackPCUsage = "cannot track ProviderConfig usage"
-	errGetPC        = "cannot get ProviderConfig"
-	errGetCreds     = "cannot get credentials"
-	errNewClient    = "cannot create SSH client"
+	errTrackPCUsage         = "cannot track ProviderConfig usage"
+	errGetPC                = "cannot get ProviderConfig"
+	errGetCreds             = "cannot get credentials"
+	errNewClient            = "cannot create SSH client"
+	errMarshalLastApplied   = "cannot marshal last-applied configuration"
+	errUnmarshalLastApplied = "cannot unmarshal last-applied configuration"
 )
+
+// annotationLastAppliedConfig records the mutable ClusterParameters this
+// controller last sent to the host, so Observe can detect drift even though
+// the k3s install script does not return the server's own configuration.
+const annotationLastAppliedConfig = "k3s.crossplane.io/last-applied-cluster-config"
 
 // Setup adds a controller that reconciles cluster-scoped Cluster managed resources.
 func Setup(mgr ctrl.Manager, o controller.Options) error {
 	name := managed.ControllerName(v1alpha1.ClusterGroupKind)
 
 	opts := []managed.ReconcilerOption{
-		managed.WithExternalConnector(&connector{
+		managed.WithTypedExternalConnector[*v1alpha1.Cluster](driftdetection.WrapConnector[*v1alpha1.Cluster](&connector{
 			kube:  mgr.GetClient(),
 			usage: resource.NewLegacyProviderConfigUsageTracker(mgr.GetClient(), &v1alpha1.ProviderConfigUsage{}),
-		}),
+		})),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithPollInterval(o.PollInterval),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))), //nolint:staticcheck // event.NewAPIRecorder still requires the legacy record.EventRecorder.
@@ -97,12 +108,7 @@ type connector struct {
 	usage *resource.LegacyProviderConfigUsageTracker
 }
 
-func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) {
-	cr, ok := mg.(*v1alpha1.Cluster)
-	if !ok {
-		return nil, errors.New(errNotCluster)
-	}
-
+func (c *connector) Connect(ctx context.Context, cr *v1alpha1.Cluster) (managed.TypedExternalClient[*v1alpha1.Cluster], error) {
 	if err := c.usage.Track(ctx, cr); err != nil {
 		return nil, errors.Wrap(err, errTrackPCUsage)
 	}
@@ -137,20 +143,22 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	return &external{
 		ssh:  sshClient,
 		host: cr.Spec.ForProvider.Host,
+		kube: c.kube,
 	}, nil
 }
 
 type external struct {
 	ssh  *sshclient.Client
 	host string
+	// kube writes the last-applied-config annotation directly to the API
+	// server from Update(). crossplane-runtime does not persist an in-memory
+	// annotation mutation made inside external.Update() -- only the status
+	// subresource is written back after a successful Update -- so relying on
+	// the reconciler here would silently discard the annotation forever.
+	kube client.Client
 }
 
-func (e *external) Observe(ctx context.Context, mg resource.Managed) (managed.ExternalObservation, error) {
-	cr, ok := mg.(*v1alpha1.Cluster)
-	if !ok {
-		return managed.ExternalObservation{}, errors.New(errNotCluster)
-	}
-
+func (e *external) Observe(ctx context.Context, cr *v1alpha1.Cluster) (managed.ExternalObservation, error) {
 	stdout, _, err := e.ssh.Execute("systemctl is-active k3s 2>/dev/null || echo inactive")
 	if err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot check k3s status")
@@ -172,6 +180,11 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 	cr.SetConditions(xpv1.Available())
 
+	upToDate, err := clusterIsUpToDate(cr)
+	if err != nil {
+		return managed.ExternalObservation{}, err
+	}
+
 	connDetails := managed.ConnectionDetails{
 		"endpoint": []byte(fmt.Sprintf("https://%s:6443", e.host)),
 	}
@@ -183,49 +196,78 @@ func (e *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 	}
 
 	return managed.ExternalObservation{
-		ResourceExists:    true,
-		ResourceUpToDate:  true,
-		ConnectionDetails: connDetails,
+		ResourceExists:   true,
+		ResourceUpToDate: upToDate,
+		// No server-defaulted spec fields to backfill: port and k3sChannel
+		// already carry kubebuilder defaults the API server fills in before
+		// this controller ever observes the resource, and the k3s install
+		// script returns no other configuration this provider could adopt
+		// into spec.
+		ResourceLateInitialized: false,
+		ConnectionDetails:       connDetails,
 	}, nil
 }
 
-func (e *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
-	cr, ok := mg.(*v1alpha1.Cluster)
-	if !ok {
-		return managed.ExternalCreation{}, errors.New(errNotCluster)
-	}
-
+func (e *external) Create(ctx context.Context, cr *v1alpha1.Cluster) (managed.ExternalCreation, error) {
 	cr.SetConditions(xpv1.Creating())
 
-	cmd := k3s.InstallCommand(k3s.InstallParams{
-		K3sVersion:        cr.Spec.ForProvider.K3sVersion,
-		K3sChannel:        cr.Spec.ForProvider.K3sChannel,
-		ClusterInit:       cr.Spec.ForProvider.ClusterInit,
-		TLSSAN:            cr.Spec.ForProvider.TLSSAN,
-		DisableTraefik:    cr.Spec.ForProvider.DisableTraefik,
-		DisableServiceLB:  cr.Spec.ForProvider.DisableServiceLB,
-		ExtraArgs:         cr.Spec.ForProvider.ExtraArgs,
-		DatastoreEndpoint: cr.Spec.ForProvider.DatastoreEndpoint,
-	})
+	cmd := k3s.InstallCommand(installParamsFor(cr.Spec.ForProvider))
 
 	_, stderr, err := e.ssh.Execute(cmd)
 	if err != nil {
 		return managed.ExternalCreation{}, errors.Wrapf(err, "cannot install k3s: %s", stderr)
 	}
 
+	if err := persistLastAppliedClusterConfig(ctx, e.kube, cr); err != nil {
+		return managed.ExternalCreation{}, err
+	}
+
 	return managed.ExternalCreation{}, nil
 }
 
-func (e *external) Update(ctx context.Context, mg resource.Managed) (managed.ExternalUpdate, error) {
+// Update re-runs the k3s install script with the resource's current
+// configuration. The install script always rewrites the full systemd unit
+// from the flags it is given and restarts the service, so — like a
+// whole-object PUT — every field is echoed on every call, including the
+// immutable ones (host, port, clusterInit, datastoreEndpoint): CEL rejects
+// any change to them, so their value here always matches what is already
+// running.
+func (e *external) Update(ctx context.Context, cr *v1alpha1.Cluster) (managed.ExternalUpdate, error) {
+	cmd := k3s.InstallCommand(installParamsFor(cr.Spec.ForProvider))
+
+	_, stderr, err := e.ssh.Execute(cmd)
+	if err != nil {
+		return managed.ExternalUpdate{}, errors.Wrapf(err, "cannot reconfigure k3s: %s", stderr)
+	}
+
+	if err := persistLastAppliedClusterConfig(ctx, e.kube, cr); err != nil {
+		return managed.ExternalUpdate{}, err
+	}
+
 	return managed.ExternalUpdate{}, nil
 }
 
-func (e *external) Delete(ctx context.Context, mg resource.Managed) (managed.ExternalDelete, error) {
-	cr, ok := mg.(*v1alpha1.Cluster)
-	if !ok {
-		return managed.ExternalDelete{}, errors.New(errNotCluster)
+// installParamsFor builds the FULL k3s install command parameters from the
+// resource's current spec. The install script is a whole-object replace, so
+// every field is echoed here, including the immutable ones (clusterInit,
+// datastoreEndpoint): CEL rejects any change to them on this resource, so
+// their value here always matches what is already running. host and port
+// are not install-script flags at all — they address the SSH connection
+// itself, not the k3s server configuration.
+func installParamsFor(p v1alpha1.ClusterParameters) k3s.InstallParams {
+	return k3s.InstallParams{
+		K3sVersion:        p.K3sVersion,
+		K3sChannel:        p.K3sChannel,
+		ClusterInit:       p.ClusterInit,
+		TLSSAN:            p.TLSSAN,
+		DisableTraefik:    p.DisableTraefik,
+		DisableServiceLB:  p.DisableServiceLB,
+		ExtraArgs:         p.ExtraArgs,
+		DatastoreEndpoint: p.DatastoreEndpoint,
 	}
+}
 
+func (e *external) Delete(ctx context.Context, cr *v1alpha1.Cluster) (managed.ExternalDelete, error) {
 	cr.SetConditions(xpv1.Deleting())
 
 	_, stderr, err := e.ssh.Execute(k3s.UninstallServerCommand())
@@ -238,4 +280,85 @@ func (e *external) Delete(ctx context.Context, mg resource.Managed) (managed.Ext
 
 func (e *external) Disconnect(ctx context.Context) error {
 	return e.ssh.Close()
+}
+
+// mutableClusterFields is the subset of ClusterParameters this controller
+// owns convergence for. host, port, clusterInit and datastoreEndpoint are
+// immutable (enforced by CEL on the CRD) and excluded here: comparing them
+// would report drift the API can never resolve, and Update would loop
+// forever trying to correct a field it can't change.
+type mutableClusterFields struct {
+	K3sVersion       string `json:"k3sVersion"`
+	K3sChannel       string `json:"k3sChannel"`
+	TLSSAN           string `json:"tlsSAN"`
+	DisableTraefik   bool   `json:"disableTraefik"`
+	DisableServiceLB bool   `json:"disableServiceLB"`
+	ExtraArgs        string `json:"extraArgs"`
+}
+
+func mutableClusterFieldsOf(p v1alpha1.ClusterParameters) mutableClusterFields {
+	return mutableClusterFields{
+		K3sVersion:       p.K3sVersion,
+		K3sChannel:       p.K3sChannel,
+		TLSSAN:           p.TLSSAN,
+		DisableTraefik:   p.DisableTraefik,
+		DisableServiceLB: p.DisableServiceLB,
+		ExtraArgs:        p.ExtraArgs,
+	}
+}
+
+// clusterIsUpToDate compares the resource's mutable fields against the
+// configuration this controller last applied. The k3s install script never
+// returns the server's own configuration, so there is nothing to compare
+// spec against directly (convention: last-applied-config annotation
+// pattern). A resource with no recorded annotation — freshly adopted, or
+// created before this annotation existed — is reported as NOT up to date:
+// the install script is safe to re-run with the resource's own declared
+// configuration, and doing so once seeds the annotation.
+func clusterIsUpToDate(cr *v1alpha1.Cluster) (bool, error) {
+	raw, ok := cr.GetAnnotations()[annotationLastAppliedConfig]
+	if !ok || raw == "" {
+		return false, nil
+	}
+	var last mutableClusterFields
+	if err := json.Unmarshal([]byte(raw), &last); err != nil {
+		return false, errors.Wrap(err, errUnmarshalLastApplied)
+	}
+	return reflect.DeepEqual(last, mutableClusterFieldsOf(cr.Spec.ForProvider)), nil
+}
+
+// persistLastAppliedClusterConfig durably records the mutable configuration
+// this controller just sent to the host, so the next Observe can detect
+// drift. It writes directly to the API server -- retried on conflict --
+// rather than mutating cr in memory and trusting the reconciler to persist
+// it: crossplane-runtime writes back the full object after Create (and
+// after an Observe that reports ResourceLateInitialized), but after a
+// successful Update() it persists ONLY the status subresource. An
+// annotation set inside Update() and left for the reconciler to carry
+// forward is silently discarded, and the comparison it feeds never
+// converges.
+func persistLastAppliedClusterConfig(ctx context.Context, kube client.Client, cr *v1alpha1.Cluster) error {
+	b, err := json.Marshal(mutableClusterFieldsOf(cr.Spec.ForProvider))
+	if err != nil {
+		return errors.Wrap(err, errMarshalLastApplied)
+	}
+	value := string(b)
+	key := client.ObjectKeyFromObject(cr)
+
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		latest := &v1alpha1.Cluster{}
+		if err := kube.Get(ctx, key, latest); err != nil {
+			return err
+		}
+		if latest.GetAnnotations()[annotationLastAppliedConfig] != value {
+			meta.AddAnnotations(latest, map[string]string{annotationLastAppliedConfig: value})
+			if err := kube.Update(ctx, latest); err != nil {
+				return err
+			}
+		}
+		// Mirror onto the in-memory object so this reconcile's own view is
+		// current, even though the persisted write came from a fresh copy.
+		meta.AddAnnotations(cr, map[string]string{annotationLastAppliedConfig: value})
+		return nil
+	})
 }
