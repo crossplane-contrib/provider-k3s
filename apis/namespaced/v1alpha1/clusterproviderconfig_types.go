@@ -45,31 +45,6 @@ type ClusterProviderConfigList struct {
 	Items           []ClusterProviderConfig `json:"items"`
 }
 
-// +kubebuilder:object:root=true
-// +kubebuilder:storageversion
-
-// +kubebuilder:printcolumn:name="AGE",type="date",JSONPath=".metadata.creationTimestamp"
-// +kubebuilder:printcolumn:name="CONFIG-NAME",type="string",JSONPath=".providerConfigRef.name"
-// +kubebuilder:printcolumn:name="RESOURCE-KIND",type="string",JSONPath=".resourceRef.kind"
-// +kubebuilder:printcolumn:name="RESOURCE-NAME",type="string",JSONPath=".resourceRef.name"
-// +kubebuilder:resource:scope=Cluster,categories={crossplane,provider,k3s}
-// A ClusterProviderConfigUsage indicates that a resource is using a ClusterProviderConfig.
-type ClusterProviderConfigUsage struct {
-	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
-
-	xpv1.TypedProviderConfigUsage `json:",inline"`
-}
-
-// +kubebuilder:object:root=true
-
-// ClusterProviderConfigUsageList contains a list of ClusterProviderConfigUsage
-type ClusterProviderConfigUsageList struct {
-	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []ClusterProviderConfigUsage `json:"items"`
-}
-
 // GetCondition returns the condition for the given ConditionType.
 func (pc *ClusterProviderConfig) GetCondition(ct xpv1.ConditionType) xpv1.Condition {
 	return pc.Status.GetCondition(ct)
@@ -92,5 +67,4 @@ func (pc *ClusterProviderConfig) SetUsers(i int64) {
 
 func init() {
 	SchemeBuilder.Register(&ClusterProviderConfig{}, &ClusterProviderConfigList{})
-	SchemeBuilder.Register(&ClusterProviderConfigUsage{}, &ClusterProviderConfigUsageList{})
 }
