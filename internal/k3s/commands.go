@@ -46,7 +46,7 @@ type JoinParams struct {
 
 // InstallCommand builds the k3s server install command string.
 func InstallCommand(params InstallParams) string {
-	var envParts []string
+	envParts := make([]string, 0, 2)
 
 	// Build INSTALL_K3S_EXEC
 	execArgs := []string{"server"}
