@@ -57,12 +57,51 @@ spec:
           spec:
             description: A NodeSpec defines the desired state of a Node.
             properties:
+              driftDetection:
+                description: |-
+                  DriftDetection configures which forProvider fields are owned outside
+                  Crossplane and how drift in those fields is detected and corrected.
+                  Absent configuration means drift detection is enabled with no
+                  ignored paths -- today's behaviour.
+                properties:
+                  ignore:
+                    description: Ignore declares fields owned outside Crossplane.
+                    items:
+                      description: |-
+                        IgnoreRule declares fields whose value is owned by something other than
+                        Crossplane. Listed fields are seeded from spec on create, then neither
+                        compared nor written from spec: the value observed on the external
+                        resource is carried forward instead.
+                      properties:
+                        paths:
+                          description: |-
+                            Paths to ignore, in Crossplane field path notation rooted at the
+                            managed resource spec, for example forProvider.k3sVersion. This is
+                            the grammar Composition patches use; JSON Pointer form
+                            (/forProvider/k3sVersion) is also accepted. List indices and
+                            wildcards are not supported -- ignore the whole list instead.
+                          items:
+                            type: string
+                          type: array
+                      type: object
+                    type: array
+                  mode:
+                    default: enabled
+                    description: Mode selects the drift detection behaviour.
+                    enum:
+                    - enabled
+                    - warn
+                    - disabled
+                    type: string
+                type: object
               forProvider:
                 description: NodeParameters are the configurable fields of a Node.
                 properties:
                   clusterRef:
-                    description: ClusterRef is a reference to the Cluster resource
-                      this node joins.
+                    description: |-
+                      ClusterRef is a reference to the Cluster resource this node joins.
+                      Changing it after creation would mean leaving one cluster and joining
+                      another, which this provider does not attempt as an in-place update.
                     properties:
                       name:
                         description: Name of the referenced object.
@@ -95,13 +134,21 @@ spec:
                     required:
                     - name
                     type: object
+                    x-kubernetes-validations:
+                    - message: clusterRef is immutable after creation
+                      rule: self == oldSelf
                   extraArgs:
                     description: ExtraArgs are additional arguments passed to k3s.
                     type: string
                   host:
-                    description: Host is the DNS name or IP address of the target
-                      machine.
+                    description: |-
+                      Host is the DNS name or IP address of the target machine. It is the
+                      SSH connection target and the sole identity this provider has for the
+                      joined node; it cannot be changed after creation.
                     type: string
+                    x-kubernetes-validations:
+                    - message: host is immutable after creation
+                      rule: self == oldSelf
                   k3sChannel:
                     default: stable
                     description: K3sChannel is the release channel.
@@ -111,15 +158,25 @@ spec:
                     type: string
                   port:
                     default: 22
-                    description: Port is the SSH port. Defaults to 22.
+                    description: |-
+                      Port is the SSH port. Defaults to 22. It addresses the same SSH
+                      connection target as host and cannot be changed after creation.
                     type: integer
+                    x-kubernetes-validations:
+                    - message: port is immutable after creation
+                      rule: self == oldSelf
                   role:
-                    description: 'Role is the role of this node: "agent" (worker)
-                      or "server" (additional control plane).'
+                    description: |-
+                      Role is the role of this node: "agent" (worker) or "server" (additional control plane).
+                      Switching a joined node's role requires leaving and rejoining, which
+                      this provider does not attempt as an in-place update.
                     enum:
                     - agent
                     - server
                     type: string
+                    x-kubernetes-validations:
+                    - message: role is immutable after creation
+                      rule: self == oldSelf
                   tlsSAN:
                     description: TLSSAN adds an additional TLS SAN (only applicable
                       for server role).

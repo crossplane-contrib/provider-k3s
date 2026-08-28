@@ -23,16 +23,23 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	xpv1 "github.com/crossplane/crossplane/apis/v2/core/v2"
+
+	"github.com/crossplane-contrib/provider-k3s/apis/common/driftdetection"
 )
 
 // ClusterParameters are the configurable fields of a Cluster.
 type ClusterParameters struct {
-	// Host is the DNS name or IP address of the target machine.
+	// Host is the DNS name or IP address of the target machine. It is the
+	// SSH connection target and the sole identity this provider has for the
+	// installed server; it cannot be changed after creation.
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="host is immutable after creation"
 	Host string `json:"host"`
 
-	// Port is the SSH port. Defaults to 22.
+	// Port is the SSH port. Defaults to 22. It addresses the same SSH
+	// connection target as host and cannot be changed after creation.
 	// +optional
 	// +kubebuilder:default=22
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="port is immutable after creation"
 	Port int `json:"port,omitempty"`
 
 	// K3sVersion is the specific k3s version to install (e.g., "v1.28.2+k3s1").
@@ -44,8 +51,11 @@ type ClusterParameters struct {
 	// +kubebuilder:default="stable"
 	K3sChannel string `json:"k3sChannel,omitempty"`
 
-	// ClusterInit enables embedded etcd for HA multi-server setup.
+	// ClusterInit enables embedded etcd for HA multi-server setup. A running
+	// server cannot be converted between embedded-etcd and non-HA mode in
+	// place, so this is immutable after creation.
 	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="clusterInit is immutable after creation"
 	ClusterInit bool `json:"clusterInit,omitempty"`
 
 	// TLSSAN adds an additional hostname or IP as a TLS Subject Alternative Name.
@@ -65,7 +75,10 @@ type ClusterParameters struct {
 	ExtraArgs string `json:"extraArgs,omitempty"`
 
 	// DatastoreEndpoint is an external datastore URL for HA (MySQL/PostgreSQL).
+	// A running server cannot be re-pointed at a new datastore in place, so
+	// this is immutable after creation.
 	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="datastoreEndpoint is immutable after creation"
 	DatastoreEndpoint string `json:"datastoreEndpoint,omitempty"`
 }
 
@@ -81,7 +94,15 @@ type ClusterObservation struct {
 // A ClusterSpec defines the desired state of a Cluster.
 type ClusterSpec struct {
 	xpv1.ClusterManagedResourceSpec `json:",inline"`
-	ForProvider                     ClusterParameters `json:"forProvider"`
+
+	// DriftDetection configures which forProvider fields are owned outside
+	// Crossplane and how drift in those fields is detected and corrected.
+	// Absent configuration means drift detection is enabled with no
+	// ignored paths -- today's behaviour.
+	// +optional
+	DriftDetection *driftdetection.DriftDetection `json:"driftDetection,omitempty"`
+
+	ForProvider ClusterParameters `json:"forProvider"`
 }
 
 // A ClusterStatus represents the observed state of a Cluster.
