@@ -4,13 +4,11 @@ metadata:
   name: my-k3s-cluster
 spec:
   forProvider:
-    host: 192.168.1.100
+    host: k3s-nodepool-0.k3s-nodepool.crossplane-system.svc.cluster.local
     port: 22
     k3sChannel: stable
     tlsSAN: k3s.example.com
     disableTraefik: true
-  providerConfigRef:
-    name: ssh-ubuntu
   writeConnectionSecretToRef:
     name: k3s-cluster-kubeconfig
     namespace: crossplane-system
