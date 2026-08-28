@@ -9,7 +9,7 @@ package v1alpha1
 import xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 
 // GetProviderConfigReference of this ProviderConfigUsage.
-func (p *ProviderConfigUsage) GetProviderConfigReference() xpv2.ProviderConfigReference {
+func (p *ProviderConfigUsage) GetProviderConfigReference() xpv2.Reference {
 	return p.ProviderConfigReference
 }
 
@@ -19,7 +19,7 @@ func (p *ProviderConfigUsage) GetResourceReference() xpv2.TypedReference {
 }
 
 // SetProviderConfigReference of this ProviderConfigUsage.
-func (p *ProviderConfigUsage) SetProviderConfigReference(r xpv2.ProviderConfigReference) {
+func (p *ProviderConfigUsage) SetProviderConfigReference(r xpv2.Reference) {
 	p.ProviderConfigReference = r
 }
 

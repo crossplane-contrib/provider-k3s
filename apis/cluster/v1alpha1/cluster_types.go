@@ -80,8 +80,8 @@ type ClusterObservation struct {
 
 // A ClusterSpec defines the desired state of a Cluster.
 type ClusterSpec struct {
-	xpv1.ManagedResourceSpec `json:",inline"`
-	ForProvider              ClusterParameters `json:"forProvider"`
+	xpv1.ClusterManagedResourceSpec `json:",inline"`
+	ForProvider                     ClusterParameters `json:"forProvider"`
 }
 
 // A ClusterStatus represents the observed state of a Cluster.

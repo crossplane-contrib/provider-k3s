@@ -71,8 +71,8 @@ type NodeObservation struct {
 
 // A NodeSpec defines the desired state of a Node.
 type NodeSpec struct {
-	xpv1.ManagedResourceSpec `json:",inline"`
-	ForProvider              NodeParameters `json:"forProvider"`
+	xpv1.ClusterManagedResourceSpec `json:",inline"`
+	ForProvider                     NodeParameters `json:"forProvider"`
 }
 
 // A NodeStatus represents the observed state of a Node.

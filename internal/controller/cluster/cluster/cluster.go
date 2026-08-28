@@ -54,7 +54,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 	opts := []managed.ReconcilerOption{
 		managed.WithExternalConnector(&connector{
 			kube:  mgr.GetClient(),
-			usage: resource.NewProviderConfigUsageTracker(mgr.GetClient(), &v1alpha1.ProviderConfigUsage{}),
+			usage: resource.NewLegacyProviderConfigUsageTracker(mgr.GetClient(), &v1alpha1.ProviderConfigUsage{}),
 		}),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithPollInterval(o.PollInterval),
@@ -94,7 +94,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 
 type connector struct {
 	kube  client.Client
-	usage *resource.ProviderConfigUsageTracker
+	usage *resource.LegacyProviderConfigUsageTracker
 }
 
 func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.ExternalClient, error) {
@@ -108,8 +108,7 @@ func (c *connector) Connect(ctx context.Context, mg resource.Managed) (managed.E
 	}
 
 	// Get cluster-scoped ProviderConfig
-	m := mg.(resource.ModernManaged)
-	ref := m.GetProviderConfigReference()
+	ref := cr.GetProviderConfigReference()
 
 	pc := &v1alpha1.ProviderConfig{}
 	if err := c.kube.Get(ctx, types.NamespacedName{Name: ref.Name}, pc); err != nil {
