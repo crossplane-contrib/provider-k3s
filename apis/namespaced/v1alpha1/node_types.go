@@ -28,10 +28,12 @@ import (
 )
 
 // NodeParameters are the configurable fields of a Node.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.port) || has(self.port)",message="port cannot be removed once set"
 type NodeParameters struct {
 	// Host is the DNS name or IP address of the target machine. It is the
 	// SSH connection target and the sole identity this provider has for the
 	// joined node; it cannot be changed after creation.
+	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="host is immutable after creation"
 	Host string `json:"host"`
 
@@ -45,12 +47,14 @@ type NodeParameters struct {
 	// ClusterRef is a reference to the Cluster resource this node joins.
 	// Changing it after creation would mean leaving one cluster and joining
 	// another, which this provider does not attempt as an in-place update.
+	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="clusterRef is immutable after creation"
 	ClusterRef xpv1.Reference `json:"clusterRef"`
 
 	// Role is the role of this node: "agent" (worker) or "server" (additional control plane).
 	// Switching a joined node's role requires leaving and rejoining, which
 	// this provider does not attempt as an in-place update.
+	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Enum=agent;server
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="role is immutable after creation"
 	Role string `json:"role"`

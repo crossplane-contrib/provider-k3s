@@ -200,6 +200,9 @@ spec:
                 - host
                 - role
                 type: object
+                x-kubernetes-validations:
+                - message: port cannot be removed once set
+                  rule: '!has(oldSelf.port) || has(self.port)'
               managementPolicies:
                 default:
                 - '*'

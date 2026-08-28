@@ -161,6 +161,13 @@ spec:
                 required:
                 - host
                 type: object
+                x-kubernetes-validations:
+                - message: port cannot be removed once set
+                  rule: '!has(oldSelf.port) || has(self.port)'
+                - message: clusterInit cannot be removed once set
+                  rule: '!has(oldSelf.clusterInit) || has(self.clusterInit)'
+                - message: datastoreEndpoint cannot be removed once set
+                  rule: '!has(oldSelf.datastoreEndpoint) || has(self.datastoreEndpoint)'
               managementPolicies:
                 default:
                 - '*'

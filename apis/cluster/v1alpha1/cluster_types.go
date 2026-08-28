@@ -28,10 +28,14 @@ import (
 )
 
 // ClusterParameters are the configurable fields of a Cluster.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.port) || has(self.port)",message="port cannot be removed once set"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.clusterInit) || has(self.clusterInit)",message="clusterInit cannot be removed once set"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.datastoreEndpoint) || has(self.datastoreEndpoint)",message="datastoreEndpoint cannot be removed once set"
 type ClusterParameters struct {
 	// Host is the DNS name or IP address of the target machine. It is the
 	// SSH connection target and the sole identity this provider has for the
 	// installed server; it cannot be changed after creation.
+	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="host is immutable after creation"
 	Host string `json:"host"`
 
