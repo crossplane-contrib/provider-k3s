@@ -1,0 +1,68 @@
+for: k3s.crossplane.io/v1alpha1/Cluster
+# A live run (2026-09-08) measured this SSH-based k3s server install
+# (download + systemd unit + readiness wait) at 19m25s (1165s) on a
+# nested/systemd-in-container test host -- against the 1200s shared
+# default assert window that leaves only ~35s of margin. This value
+# gives ~635s of margin over the observed duration.
+uptest.upbound.io/timeout: "1800"
+uptest.upbound.io/post-assert-hook: ../../test/hooks/post-assert-cluster.sh
+# A live run (2026-09-11) measured the cost-gate entry (tlsSAN alone)
+# at 65s patch-to-reconverge, well inside the ~700s per-field ceiling
+# the six mutable fields below are budgeted against -- see the ticket
+# this corpus was authored under.
+crossplane.io/update-test: |
+  - field: tlsSAN
+    value: "k3s-updated.example.com"
+    # tlsSAN mirrors into status.atProvider from this controller's OWN
+    # last-applied-cluster-config annotation, not from host state -- the
+    # k3s install script reports no TLS SAN configuration of its own
+    # (cluster.go Observe(), the hasLast branch). So this proves Update()
+    # ran, the SSH install command exited 0, and the annotation
+    # round-tripped; it does NOT prove k3s itself picked up the new SAN
+    # into its serving certificate.
+  - field: k3sChannel
+    value: "latest"
+    # Mirrors into status.atProvider from the last-applied-cluster-config
+    # annotation, the same limitation as tlsSAN above: the k3s install
+    # script reports no channel of its own, so this proves the update
+    # path ran and the annotation round-tripped, not that the installed
+    # binary is actually tracking the "latest" channel.
+  - field: extraArgs
+    value: "--flannel-backend=host-gw --write-kubeconfig-mode=644"
+    # Mirrors into status.atProvider from the last-applied-cluster-config
+    # annotation, the same limitation as tlsSAN above. The flannel-backend
+    # flag is kept unchanged from the create-time value: this fixture's
+    # host cannot create a vxlan netdevice (see the create-time comment
+    # on this field in the manifest), so the target value preserves
+    # host-gw while still differing from the create-time value by adding
+    # a second flag.
+  - field: disableTraefik
+    value: true
+    # Mirrors into status.atProvider from the last-applied-cluster-config
+    # annotation, the same limitation as tlsSAN above. The create-time
+    # value of this field is false specifically so this entry has a
+    # genuine state to change into -- a boolean update-test target must
+    # be true (false is indistinguishable from "not set" after a JSON
+    # round-trip and is skipped as a target).
+  - field: disableServiceLB
+    value: true
+    # Mirrors into status.atProvider from the last-applied-cluster-config
+    # annotation, the same limitation as tlsSAN above.
+  - field: k3sVersion
+    value: "v1.30.5+k3s1"
+    expect: "k3s version v1.30.5+k3s1 (9b586704)"
+    # The only field of the six above with a genuine observation:
+    # status.atProvider.k3sVersion comes from a live `k3s --version`
+    # probe over SSH (cluster.go Observe()), not from the last-applied
+    # annotation, so this is the one entry that actually proves the new
+    # version was installed rather than merely that the update path ran.
+    # expect: differs from value: because the probe returns the full
+    # "k3s version vX.Y.Z+k3sN (<commit>)" line, not the bare version
+    # string this field is set to -- the trailing short git commit hash
+    # was discovered from a live run (2026-09-11) rather than guessed:
+    # it is fixed for this exact release tag, since the k3s build
+    # embeds the commit it was cut from. Tested last and measured
+    # separately from the five echo fields above: it is the only field
+    # whose update forces a genuine binary change (a real download and
+    # reinstall of a different k3s release), so it is the slowest of
+    # the six.

@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -26,8 +27,10 @@ import (
 	"github.com/alecthomas/kingpin/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	authv1 "k8s.io/api/authorization/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -38,6 +41,7 @@ import (
 
 	changelogsv1alpha1 "github.com/crossplane/crossplane-runtime/v2/apis/changelogs/proto/v1alpha1"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/controller"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/feature"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/gate"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
@@ -51,6 +55,17 @@ import (
 	"github.com/crossplane-contrib/provider-k3s/apis"
 	k3s "github.com/crossplane-contrib/provider-k3s/internal/controller"
 	"github.com/crossplane-contrib/provider-k3s/internal/version"
+)
+
+const (
+	// safeStartPrecheckTimeout bounds the total time spent retrying the
+	// canWatchCRD RBAC precheck. crossplane-rbac-manager has been observed
+	// to resolve a fresh provider revision's ClusterRole within a couple of
+	// seconds of the provider pod starting, so 30s is ample headroom.
+	safeStartPrecheckTimeout = 30 * time.Second
+	// safeStartPrecheckInterval is the backoff between retries of a denied
+	// SelfSubjectAccessReview during the SafeStart precheck.
+	safeStartPrecheckInterval = 2 * time.Second
 )
 
 func main() {
@@ -128,7 +143,6 @@ func main() {
 		PollInterval:            *pollInterval,
 		GlobalRateLimiter:       ratelimiter.NewGlobal(*maxReconcileRate),
 		Features:                &feature.Flags{},
-		Gate:                    new(gate.Gate[schema.GroupVersionKind]),
 		MetricOptions: &controller.MetricOptions{
 			PollStateMetricInterval: *pollStateMetricInterval,
 			MRMetrics:               metricRecorder,
@@ -156,7 +170,88 @@ func main() {
 		o.ChangeLogOptions = &clo
 	}
 
-	kingpin.FatalIfError(customresourcesgate.Setup(mgr, o), "Cannot setup CRD gate controller")
-	kingpin.FatalIfError(k3s.SetupGated(mgr, o), "Cannot setup K3s controllers")
+	precheckCtx, cancel := context.WithTimeout(context.Background(), safeStartPrecheckTimeout)
+	defer cancel()
+	canSafeStart, err := canWatchCRD(precheckCtx, mgr)
+	kingpin.FatalIfError(err, "SafeStart precheck failed")
+	if canSafeStart {
+		crdGate := new(gate.Gate[schema.GroupVersionKind])
+		o.Gate = crdGate
+		gateOpts := controller.Options{
+			Gate:                    crdGate,
+			Logger:                  log,
+			MaxConcurrentReconciles: 1,
+		}
+		kingpin.FatalIfError(customresourcesgate.Setup(mgr, gateOpts), "Cannot setup CRD gate")
+		kingpin.FatalIfError(k3s.SetupGated(mgr, o), "Cannot setup K3s controllers")
+	} else {
+		log.Info("Provider has missing RBAC permissions for watching CRDs, controller SafeStart capability will be disabled")
+		kingpin.FatalIfError(k3s.Setup(mgr, o), "Cannot setup K3s controllers")
+	}
 	kingpin.FatalIfError(mgr.Start(ctrl.SetupSignalHandler()), "Cannot start controller manager")
+}
+
+// canWatchCRD performs a SelfSubjectAccessReview to determine whether the
+// provider's service account has get/list/watch permissions on
+// CustomResourceDefinitions. Without these permissions the CRD gate
+// controller cannot function, so callers should fall back to the non-gated
+// Setup path instead of crash-looping.
+//
+// crossplane-rbac-manager creates this provider revision's ClusterRole
+// asynchronously after the provider pod's ServiceAccount and
+// ClusterRoleBinding already exist, so a denial on the very first check does
+// not prove RBAC was never granted — it may only mean the role has not
+// propagated to the API server's authorizer yet. The check is retried with a
+// short backoff until every verb is allowed or the context deadline is
+// reached, so a fresh pod does not permanently disable SafeStart purely
+// because it raced the RBAC manager at startup.
+func canWatchCRD(ctx context.Context, mgr ctrl.Manager) (bool, error) {
+	if err := authv1.AddToScheme(mgr.GetScheme()); err != nil {
+		return false, err
+	}
+
+	var allowed bool
+	pollErr := wait.PollUntilContextCancel(ctx, safeStartPrecheckInterval, true, func(pollCtx context.Context) (bool, error) {
+		ok, err := hasCRDWatchPermissions(pollCtx, mgr)
+		if err != nil {
+			return false, err
+		}
+		allowed = ok
+		// A denial keeps polling until the context deadline is reached;
+		// permission being granted stops the poll immediately.
+		return ok, nil
+	})
+	if pollErr != nil && !wait.Interrupted(pollErr) {
+		return false, pollErr
+	}
+	// wait.Interrupted means the context deadline was reached without every
+	// verb being allowed - that is a denial, not an error. allowed already
+	// reflects the last observed result (false, since the poll condition
+	// only returns true on success).
+	return allowed, nil
+}
+
+// hasCRDWatchPermissions performs a single round of SelfSubjectAccessReview
+// checks for get/list/watch on CustomResourceDefinitions, returning true
+// only if every verb is allowed.
+func hasCRDWatchPermissions(ctx context.Context, mgr ctrl.Manager) (bool, error) {
+	verbs := []string{"get", "list", "watch"}
+	for _, verb := range verbs {
+		sar := &authv1.SelfSubjectAccessReview{
+			Spec: authv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &authv1.ResourceAttributes{
+					Group:    "apiextensions.k8s.io",
+					Resource: "customresourcedefinitions",
+					Verb:     verb,
+				},
+			},
+		}
+		if err := mgr.GetClient().Create(ctx, sar); err != nil {
+			return false, errors.Wrapf(err, "unable to perform RBAC check for verb %s on CustomResourceDefinitions", verb)
+		}
+		if !sar.Status.Allowed {
+			return false, nil
+		}
+	}
+	return true, nil
 }

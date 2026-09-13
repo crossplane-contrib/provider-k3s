@@ -8,10 +8,22 @@ on:
   pull_request: {}
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 env:
-  # Common versions
-  GOLANGCI_VERSION: "v2.13.2"
-  DOCKER_BUILDX_VERSION: "v0.23.0"
+  # Keep in sync with GOLANGCILINT_VERSION in the Makefile.
+  GOLANGCI_VERSION: 'v2.13.2'
+  DOCKER_BUILDX_VERSION: 'v0.23.0'
+  # Security tooling versions -- kept identical to release.yaml's security
+  # scan job so a PR and a release scan with the same tools. vens is pinned even
+  # though this workflow never installs or runs it (that is release.yaml's
+  # job): the pin exists so the two workflows have both sides to compare for
+  # tool-version parity.
+  GOVULNCHECK_VERSION: v1.6.0
+  CYCLONEDX_GOMOD_VERSION: v1.10.0
+  VENS_VERSION: v0.4.0
+  GRYPE_VERSION: v0.116.1
 
 jobs:
   detect-noop:
@@ -19,11 +31,15 @@ jobs:
     outputs:
       noop: ${{ steps.noop.outputs.should_skip }}
     steps:
+      # NOTE: no github_token here, deliberately. Passing one makes the action
+      # call the API for duplicate detection, which fails with "Resource not
+      # accessible by integration" under a restricted GITHUB_TOKEN -- notably
+      # on Dependabot PRs, where it took down every downstream job. This
+      # matches provider-upjet-aws, which omits the token for the same reason.
       - name: Detect No-op Changes
         id: noop
-        uses: fkirc/skip-duplicate-actions@b974a9395958c231af965b70070979a577efa578 # v5.3.2
+        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf # v5.3.1
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
           paths_ignore: '["**.md", "**.png", "**.jpg"]'
           do_not_skip: '["workflow_dispatch", "schedule", "push"]'
 
@@ -34,23 +50,24 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: true
 
       - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
 
       - name: Vendor Dependencies
         run: make vendor vendor.check
 
+      # We could run 'make lint' but we prefer this action because it leaves
+      # 'annotations' (i.e. it comments on PRs to point out linter violations).
       - name: Lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: ${{ env.GOLANGCI_VERSION }}
-          args: --timeout=5m
 
   check-diff:
     runs-on: ubuntu-latest
@@ -59,12 +76,12 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: true
 
       - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
 
@@ -72,7 +89,174 @@ jobs:
         run: make vendor vendor.check
 
       - name: Check Diff
-        run: make check-diff
+        id: check-diff
+        run: |
+          mkdir -p _output
+          make check-diff
+
+      - name: Show diff
+        if: failure() && steps.check-diff.outcome == 'failure'
+        run: git diff
+
+  # check-diff proves the committed CRDs match what the generator produces.
+  # That is consistency, not compatibility -- a regeneration can be perfectly
+  # faithful and still delete a field somebody has applied, and the deletion
+  # hides inside a large legitimate generated diff. This job is the other half.
+  #
+  # `make reviewable` runs the same script, and that is the gate every branch
+  # in this repository passes through before it is merged. This job exists for
+  # the one path that never reaches it: a pull request opened by hand. Hence
+  # pull_request only -- on a push to main the merge has already happened and
+  # the comparison has already been made.
+  check-breaking-changes:
+    runs-on: ubuntu-latest
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true' && github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: true
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      # The default checkout is shallow and creates no ref for the base branch,
+      # so the comparison has nothing to resolve unless the base is fetched
+      # explicitly. Skipping this step does not weaken the check -- it silently
+      # empties it, which is why hack/check-breaking-changes.sh exits 2 rather
+      # than 0 when the base will not resolve.
+      - name: Fetch the base branch
+        run: |
+          git fetch --no-tags --depth=1 origin \
+            "+refs/heads/${GITHUB_BASE_REF}:refs/remotes/origin/${GITHUB_BASE_REF}"
+
+      # Through make, not the script directly, so this job and a reviewer run
+      # the same entry point. The crddiff pin lives in the script.
+      - name: Check for breaking CRD schema changes
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: make check-breaking-changes
+
+  check-conventions:
+    runs-on: ubuntu-latest
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: true
+
+      # Repo-specific static checks from AGENTS.md (test naming, KUBECTL usage,
+      # error wrapping, stdlib errors import). Pure grep -- no toolchain needed.
+      - name: Check Conventions
+        run: make check-conventions
+
+  # Cheap mirror of the release gate's security checks: govulncheck and the
+  # license check only -- no image build, no attestation,
+  # no vens. Reads the same security/vex-exceptions.openvex.json the release
+  # gate reads, so a PR and a release cannot disagree about what is waived.
+  security-checks:
+    runs-on: ubuntu-latest
+    needs: detect-noop
+    if: needs.detect-noop.outputs.noop != 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: true
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Vendor Dependencies
+        run: make vendor vendor.check
+
+      - name: Install security tools
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
+          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@${{ env.CYCLONEDX_GOMOD_VERSION }}
+
+      # Collect the waived vulnerability IDs once, converged onto
+      # release.yaml's implementation: same VEX_EXCEPTIONS file, same
+      # not_affected/fixed status filter, so a PR
+      # and a release cannot disagree about what is waived.
+      - name: Collect VEX exceptions
+        run: |
+          EXC="security/vex-exceptions.openvex.json"
+          if [ ! -f "$EXC" ]; then
+            echo "::notice::$EXC not present, no exceptions applied"
+            : > /tmp/vex-waived.txt
+          else
+            jq -r '[.statements[]?
+                    | select(.status == "not_affected" or .status == "fixed")
+                    | (.vulnerability.name, ((.vulnerability.aliases // [])[]))]
+                   | unique | .[]' "$EXC" | sort -u > /tmp/vex-waived.txt
+            COUNT=$(wc -l < /tmp/vex-waived.txt | tr -d ' ')
+            echo "::notice::applying $COUNT waived vulnerability id(s) from $EXC"
+            [ "$COUNT" -eq 0 ] || sed 's/^/  waived: /' /tmp/vex-waived.txt
+          fi
+
+      # Reachable-CVE gate, converged onto release.yaml's implementation.
+      # `-format json` always exits 0, so the
+      # waiver logic below is reachable under bash -e -- the previous
+      # `OUT="$(govulncheck ./...)"; RC=$?` capture shape aborted the step at
+      # that line whenever govulncheck exited 3, making the waiver path dead
+      # code.
+      - name: "Gate: govulncheck (reachable CVEs)"
+        run: |
+          set -o pipefail
+          govulncheck -format json ./... > /tmp/govulncheck.json
+          jq -r 'select(.finding)
+                 | select(.finding.trace[0].function != null)
+                 | .finding.osv' /tmp/govulncheck.json | sort -u > /tmp/reachable.txt
+
+          REMAINING=$(comm -23 /tmp/reachable.txt /tmp/vex-waived.txt)
+          if [ -n "$REMAINING" ]; then
+            echo "::error::reachable vulnerabilities with no VEX exception:"
+            printf '%s\n' "$REMAINING" | sed 's/^/  /'
+            echo "Fix them, or add a justified statement to security/vex-exceptions.openvex.json."
+            exit 1
+          fi
+          echo "PASS: no unwaived reachable vulnerabilities"
+
+      # License gate, converged onto release.yaml's implementation.
+      # cyclonedx-gomod records most licenses under
+      # .evidence.licenses, not .licenses -- reading .licenses alone finds
+      # nothing and passes vacuously, so the zero-total canary below catches
+      # that failure mode as well as an actual GPL-family dependency.
+      # `.expression` is read too, for SPDX expressions such as
+      # "MIT OR GPL-3.0-only" where `.license` is null.
+      - name: "Gate: license compliance"
+        run: |
+          cyclonedx-gomod mod -json -licenses -output /tmp/sbom-licenses.json
+          jq -r '.components[]?
+                 | ((.licenses // []) + (.evidence.licenses // []))[]
+                 | (.license.id // .license.name // .expression // empty)' \
+            /tmp/sbom-licenses.json | sort > /tmp/licenses.txt
+
+          TOTAL=$(wc -l < /tmp/licenses.txt | tr -d ' ')
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "::error::license scan found 0 licenses total -- the extraction expression is broken, not the dependency tree clean"
+            exit 1
+          fi
+
+          # Not ^-anchored: SPDX expressions and free-text license names
+          # (e.g. "GNU Lesser General Public License v2.1") both need an
+          # unanchored match.
+          if grep -iE '(^|[^A-Za-z0-9.-])(A|L)?GPL|GNU (Lesser |Affero )?General Public' /tmp/licenses.txt; then
+            echo "::error::GPL-family license detected in dependency tree"
+            exit 1
+          fi
+          echo "PASS: license check passed -- $TOTAL license(s) found, no GPL-family licenses"
 
   unit-tests:
     runs-on: ubuntu-latest
@@ -81,7 +265,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: true
 
@@ -89,7 +273,7 @@ jobs:
         run: git fetch --prune --unshallow
 
       - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
 
@@ -99,30 +283,38 @@ jobs:
       - name: Run Unit Tests
         run: make -j2 test
 
-      - name: Publish Unit Test Coverage
-        uses: codecov/codecov-action@v7
-        with:
-          flags: unittests
-          file: _output/tests/linux_amd64/coverage.txt
+      - name: Run Tool Module Tests
+        run: make test.tools
 
-  e2e-tests:
+  # Builds the provider xpkg and installs it into a kind cluster. This proves
+  # the provider is buildable and deployable on every PR *without* talking to
+  # anything external. Live E2E is gated behind the /test-examples comment
+  # trigger in uptest-trigger.yaml, because provisioning costs real time and CPU.
+  local-deploy:
     runs-on: ubuntu-latest
     needs: detect-noop
     if: needs.detect-noop.outputs.noop != 'true'
 
     steps:
+      - name: Cleanup Disk
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          large-packages: false
+          swap-storage: false
+
       - name: Setup QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
         with:
           platforms: all
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
         with:
           version: ${{ env.DOCKER_BUILDX_VERSION }}
+          install: true
 
       - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           submodules: true
 
@@ -130,16 +322,32 @@ jobs:
         run: git fetch --prune --unshallow
 
       - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
 
       - name: Vendor Dependencies
         run: make vendor vendor.check
 
-      - name: Run the end to end tests
-        run: make e2e
+      - name: Build Artifacts
+        run: make -j2 build
         env:
           # We're using docker buildx, which doesn't actually load the images it
           # builds by default. Specifying --load does so.
           BUILD_ARGS: "--load"
+
+      # `local-deploy` on its own only deploys the xpkg -- it is the
+      # UPTEST_LOCAL_DEPLOY_TARGET hook -- so bring the control plane up first.
+      - name: Deploy Locally Built Provider Package
+        run: make controlplane.up local-deploy
+
+      - name: Collect Cluster Dump
+        if: failure()
+        run: make controlplane.dump
+
+      - name: Upload Cluster Dump
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: controlplane-dump-local-deploy
+          path: ./_output/controlplane-dump

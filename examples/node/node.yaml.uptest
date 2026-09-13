@@ -1,0 +1,66 @@
+for: k3s.crossplane.io/v1alpha1/Node
+# A live run (2026-09-02) measured the referenced Cluster's own SSH
+# install at 19m25s (1165s) end to end, and Node can't even Connect()
+# until that Cluster's connection secret exists -- so Node's own
+# window has to cover the full Cluster install before its own SSH
+# agent join can even start. This value covers a full-length Cluster
+# install (see the Cluster annotation below) plus room for the Node's
+# own join and readiness confirmation on the same class of host.
+uptest.upbound.io/timeout: "3000"
+uptest.upbound.io/post-assert-hook: ../../test/hooks/post-assert-node.sh
+# A live run (2026-09-11) measured the equivalent Cluster-scope cost-gate
+# entry (tlsSAN alone) at 65s patch-to-reconverge, well inside the ~700s
+# per-field ceiling the four mutable Node fields below are budgeted
+# against -- see the ticket this corpus was authored under.
+crossplane.io/update-test: |
+  - field: tlsSAN
+    value: "node-updated.example.com"
+    # tlsSAN mirrors into status.atProvider from this controller's OWN
+    # last-applied-node-config annotation, not from host state (node.go
+    # Observe(), the hasLast branch). For an agent-role Node (this
+    # fixture's role), tlsSAN is not even passed to the k3s join command
+    # in the first place -- JoinCommand only adds --tls-san when
+    # Role == "server" (internal/k3s/commands.go) -- so this entry
+    # proves only that Update() ran, the SSH join command exited 0, and
+    # the annotation round-tripped; it never reaches the backend at all
+    # for this fixture's role.
+  - field: k3sChannel
+    value: "latest"
+    # Mirrors into status.atProvider from the last-applied-node-config
+    # annotation, the same limitation as tlsSAN above: the k3s join
+    # script reports no channel of its own, so this proves the update
+    # path ran and the annotation round-tripped, not that the installed
+    # binary is actually tracking the "latest" channel.
+  - field: extraArgs
+    value: "--node-label=updated=true"
+    # Mirrors into status.atProvider from the last-applied-node-config
+    # annotation, the same limitation as tlsSAN above. Unlike tlsSAN,
+    # extraArgs DOES reach the join command for an agent role
+    # (JoinCommand's else-if branch in internal/k3s/commands.go), but
+    # the value asserted back is still the controller's own recorded
+    # copy, not an independent read-back of the node's kubelet labels.
+  - field: k3sVersion
+    value: "v1.30.5+k3s1"
+    expect: "k3s version v1.30.5+k3s1 (9b586704)"
+    # The only field of Node's four mutable fields with a genuine
+    # observation: status.atProvider.k3sVersion comes from a live
+    # `k3s --version` probe over SSH (node.go Observe()), not from the
+    # last-applied annotation, so this is the one entry that actually
+    # proves the new version was installed rather than merely that the
+    # update path ran. expect: differs from value: for the same reason
+    # as the Cluster corpus's k3sVersion entry: the probe returns the
+    # full "k3s version vX.Y.Z+k3sN (<commit>)" line -- the trailing
+    # short git commit hash was discovered from a live run (2026-09-11)
+    # rather than guessed, and is fixed for this exact release tag.
+    # Tested last and measured separately from the three echo fields
+    # above: it is the only field whose update forces a genuine binary
+    # change, so it is the slowest of the four.
+---
+for: k3s.crossplane.io/v1alpha1/Cluster
+uptest.upbound.io/pre-delete-hook: ./testhooks/delete-node.sh
+# A live run (2026-09-02) measured this SSH-based k3s server install
+# (download + systemd unit + readiness wait) at 19m25s (1165s) on a
+# nested/systemd-in-container test host -- against the 1200s shared
+# default assert window that leaves only ~35s of margin. This value
+# gives ~635s of margin over the observed duration.
+uptest.upbound.io/timeout: "1800"

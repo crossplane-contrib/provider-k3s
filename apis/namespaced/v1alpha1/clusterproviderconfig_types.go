@@ -17,7 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
-	xpv1 "github.com/crossplane/crossplane/apis/v2/core/v2"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -46,12 +46,12 @@ type ClusterProviderConfigList struct {
 }
 
 // GetCondition returns the condition for the given ConditionType.
-func (pc *ClusterProviderConfig) GetCondition(ct xpv1.ConditionType) xpv1.Condition {
+func (pc *ClusterProviderConfig) GetCondition(ct xpv2.ConditionType) xpv2.Condition {
 	return pc.Status.GetCondition(ct)
 }
 
 // SetConditions sets conditions on the resource status.
-func (pc *ClusterProviderConfig) SetConditions(c ...xpv1.Condition) {
+func (pc *ClusterProviderConfig) SetConditions(c ...xpv2.Condition) {
 	pc.Status.SetConditions(c...)
 }
 

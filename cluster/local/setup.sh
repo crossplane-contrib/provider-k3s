@@ -28,7 +28,7 @@ RUN apt-get update \
 CMD ["/lib/systemd/systemd"]
 EOF
 
-${KIND} load docker-image provider-k3s-node --name local-dev
+${KIND} load docker-image provider-k3s-node --name "${KIND_CLUSTER_NAME:-local-dev}"
 
 ###
 # SSH configuration
