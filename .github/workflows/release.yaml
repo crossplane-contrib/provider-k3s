@@ -1,0 +1,845 @@
+# Release Workflow
+#
+# One human gate, then everything is automatic. Dispatching the Tag workflow
+# creates the release tag; the resulting tag push drives this pipeline end to
+# end:
+#
+#   resolve -> security-gate -> build-and-push -> attest -> release
+#
+# The ordering is the point. security-gate scans source and modules and needs
+# no image, so it runs BEFORE anything reaches the registry -- an xpkg tag
+# cannot be un-pushed, so a gate that ran afterwards would only be able to
+# annotate a bad release, not prevent it. attest runs after the push because
+# signing, SBOM generation and provenance all read the published image.
+#
+# Gates are deliberately at their strictest setting for now (grype
+# --fail-on negligible, unfixed vulnerabilities included). The sanctioned way
+# to ship past a finding is a VEX statement in security/vex-exceptions.openvex.json,
+# which is applied to BOTH grype and govulncheck -- not by loosening a
+# threshold. Thresholds can be tuned down later; the exception file keeps an
+# audit trail of what was waived and why.
+
+name: Release
+
+# Dispatched by tag.yaml immediately after it creates the release tag, and
+# manually for re-runs. There is deliberately no `on: push: tags` trigger: a tag
+# pushed by tag.yaml uses GITHUB_TOKEN and so cannot start a workflow run at
+# all, while a tag pushed by hand would start a second, concurrent release of a
+# version that tag.yaml had already dispatched. Making dispatch the only entry
+# point keeps exactly one release run per version.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. v1.0.0-rc1). Must already exist as a tag."
+        required: true
+
+permissions:
+  contents: write          # create releases, attach assets
+  pull-requests: read      # read release-note blocks from merged PR bodies
+  id-token: write          # keyless cosign via Sigstore OIDC
+  attestations: write      # SLSA provenance attestation
+
+# Never let two releases of the same version run concurrently -- they would
+# race on `xpkg append`, which re-pushes the image and moves the digest out
+# from under the other run's signature.
+concurrency:
+  group: release-${{ github.event.inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # ── Image coordinates ─────────────────────────────────────────────
+  # Derived from the same XPKG_REGISTRY/UP_ORG pair as the Makefile's
+  # XPKG_REG_ORGS (xpkg.upbound.io/$(UP_ORG)). A workflow-level env entry
+  # cannot reference another one, so the host and package name are spelled
+  # out in XPKG_IMAGE rather than composed.
+  XPKG_REGISTRY: xpkg.upbound.io
+  XPKG_IMAGE: xpkg.upbound.io/${{ secrets.UP_ORG }}/provider-k3s
+  # ── Credentials ───────────────────────────────────────────────────
+  # An Upbound API token (UP_API_TOKEN) plus an organization (UP_ORG), with
+  # UP_ROBOT_ID as the registry username. Copied into env so steps can test
+  # 'env.XXX != ""'.
+  UP_API_TOKEN: ${{ secrets.UP_API_TOKEN }}
+  UP_ORG: ${{ secrets.UP_ORG }}
+  UP_ROBOT_ID: ${{ secrets.UP_ROBOT_ID }}
+  # ── Security gate ─────────────────────────────────────────────────
+  VEX_EXCEPTIONS: security/vex-exceptions.openvex.json
+  VENS_CONFIG: security/vens-config.yaml
+  # Lowest severity that fails the build. Currently the strictest setting
+  # grype offers; raise to low/medium/high to relax.
+  GRYPE_FAIL_ON: negligible
+  DOCKER_BUILDX_VERSION: 'v0.23.0'
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════
+  # Resolve the version once, so every downstream job agrees on it
+  # regardless of which trigger fired.
+  # ════════════════════════════════════════════════════════════════════
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          TAG="${INPUT_VERSION:-$REF_NAME}"
+          case "$TAG" in
+            v*) ;;
+            *)
+              echo "::error::resolved version '$TAG' does not look like a release tag (expected a leading 'v')"
+              exit 1
+              ;;
+          esac
+          echo "Releasing $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  # ════════════════════════════════════════════════════════════════════
+  # Security gate: runs on source only, so nothing is published unless
+  # every check here passes.
+  # ════════════════════════════════════════════════════════════════════
+  security-gate:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: true
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      # govulncheck reports stdlib CVEs against the toolchain it runs under,
+      # so this must track go.mod -- a pin drifting behind it would assess a
+      # Go version the shipped binary is not built with.
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      # Pinned, not @latest. A workflow whose purpose is supply-chain integrity
+      # should not resolve its own scanners at run time: an upstream release can
+      # change findings, or fail to build, with no change in this repository.
+      # Bump these deliberately.
+      #
+      # vens is installed from its release tarball rather than `go install`.
+      # Every tagged version of vens carries a replace directive in go.mod, and
+      # `go install pkg@version` refuses such modules outright ("must not
+      # contain directives that would cause it to be interpreted differently
+      # than if it were the main module"). That applies to @latest too, so the
+      # go-install form could never have worked -- verified against v0.3.0,
+      # v0.3.2 and v0.4.0. The upstream docs recommend it anyway, and their
+      # prebuilt-binary URLs (vens_Linux_x86_64.tar.gz) do not match the actual
+      # release asset names either, so both documented paths are wrong.
+      - name: Install security tools
+        env:
+          GOVULNCHECK_VERSION: v1.6.0
+          CYCLONEDX_GOMOD_VERSION: v1.10.0
+          VENS_VERSION: v0.4.0
+          GRYPE_VERSION: v0.116.1
+        run: |
+          set -euo pipefail
+
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          go install "github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@${CYCLONEDX_GOMOD_VERSION}"
+
+          # vens: download, verify against the published SHA256SUMS, install.
+          TARBALL="vens-${VENS_VERSION}-linux-amd64.tar.gz"
+          BASE="https://github.com/venslabs/vens/releases/download/${VENS_VERSION}"
+          curl -sSfL "${BASE}/${TARBALL}" -o "/tmp/${TARBALL}"
+          curl -sSfL "${BASE}/SHA256SUMS" -o /tmp/vens-SHA256SUMS
+          EXPECTED=$(grep " ${TARBALL}\$" /tmp/vens-SHA256SUMS | awk '{print $1}')
+          ACTUAL=$(sha256sum "/tmp/${TARBALL}" | awk '{print $1}')
+          if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::vens checksum mismatch (expected '${EXPECTED}', got '${ACTUAL}')"
+            exit 1
+          fi
+          tar xzf "/tmp/${TARBALL}" -C /tmp vens
+          install -m 0755 /tmp/vens /usr/local/bin/vens
+
+          # grype: same treatment as vens. The previous form piped
+          # raw.githubusercontent.com/anchore/grype/main/install.sh straight to
+          # sh -- an unverified fetch from a MUTABLE branch ref, executed in a
+          # job that holds id-token: write (enough to mint Sigstore tokens
+          # asserting this repository's identity). Release tarball plus
+          # checksum instead, so nothing in this job runs unverified code.
+          GRYPE_TARBALL="grype_${GRYPE_VERSION#v}_linux_amd64.tar.gz"
+          GRYPE_BASE="https://github.com/anchore/grype/releases/download/${GRYPE_VERSION}"
+          curl -sSfL "${GRYPE_BASE}/${GRYPE_TARBALL}" -o "/tmp/${GRYPE_TARBALL}"
+          curl -sSfL "${GRYPE_BASE}/grype_${GRYPE_VERSION#v}_checksums.txt" -o /tmp/grype-checksums.txt
+          G_EXPECTED=$(grep " ${GRYPE_TARBALL}\$" /tmp/grype-checksums.txt | awk '{print $1}')
+          G_ACTUAL=$(sha256sum "/tmp/${GRYPE_TARBALL}" | awk '{print $1}')
+          if [ -z "$G_EXPECTED" ] || [ "$G_EXPECTED" != "$G_ACTUAL" ]; then
+            echo "::error::grype checksum mismatch (expected '${G_EXPECTED}', got '${G_ACTUAL}')"
+            exit 1
+          fi
+          tar xzf "/tmp/${GRYPE_TARBALL}" -C /tmp grype
+          install -m 0755 /tmp/grype /usr/local/bin/grype
+          grype db update -q
+
+          # `cmd | head -2` under `set -euo pipefail` is a race: if head
+          # exits after its second line before the writer finishes, the
+          # writer takes SIGPIPE (128+13=141) and pipefail promotes that
+          # into the pipeline's status, aborting this step. Read to EOF
+          # into an array instead -- nothing closes the pipe early, so the
+          # writer never gets signalled -- then print the first two lines
+          # from bash's own memory.
+          mapfile -t GOVULNCHECK_VERSION_LINES < <(govulncheck -version)
+          printf '%s\n' "${GOVULNCHECK_VERSION_LINES[@]:0:2}"
+          vens --version || true
+          mapfile -t GRYPE_VERSION_LINES < <(grype version)
+          printf '%s\n' "${GRYPE_VERSION_LINES[@]:0:2}"
+
+      # Collect the waived vulnerability IDs once. OpenVEX statuses
+      # not_affected and fixed mean "this does not apply to us"; both the
+      # canonical id and any aliases are collected, because grype reports
+      # CVE/GHSA ids while govulncheck reports GO-YYYY-NNNN for the same
+      # vulnerability.
+      - name: Collect VEX exceptions
+        id: vex
+        run: |
+          if [ ! -f "$VEX_EXCEPTIONS" ]; then
+            echo "::notice::$VEX_EXCEPTIONS not present, no exceptions applied"
+            : > /tmp/vex-waived.txt
+          else
+            jq -r '[.statements[]?
+                    | select(.status == "not_affected" or .status == "fixed")
+                    | (.vulnerability.name, ((.vulnerability.aliases // [])[]))]
+                   | unique | .[]' "$VEX_EXCEPTIONS" | sort -u > /tmp/vex-waived.txt
+            COUNT=$(wc -l < /tmp/vex-waived.txt | tr -d ' ')
+            echo "::notice::applying $COUNT waived vulnerability id(s) from $VEX_EXCEPTIONS"
+            [ "$COUNT" -eq 0 ] || sed 's/^/  waived: /' /tmp/vex-waived.txt
+          fi
+
+      # Gate 1: no reachable (symbol-level) CVEs.
+      #
+      # `govulncheck ./...` exits 3 on findings but offers no suppression
+      # mechanism, so the JSON form is used instead: it always exits 0, and
+      # findings whose trace has a function-level frame are the reachable
+      # ones. Waived ids are subtracted so the same VEX file governs this
+      # gate and grype below.
+      - name: "Gate: govulncheck (reachable CVEs)"
+        run: |
+          set -o pipefail
+          govulncheck -format json ./... > /tmp/govulncheck.json
+          jq -r 'select(.finding)
+                 | select(.finding.trace[0].function != null)
+                 | .finding.osv' /tmp/govulncheck.json | sort -u > /tmp/reachable.txt
+
+          REMAINING=$(comm -23 /tmp/reachable.txt /tmp/vex-waived.txt)
+          if [ -n "$REMAINING" ]; then
+            echo "::error::reachable vulnerabilities with no VEX exception:"
+            printf '%s\n' "$REMAINING" | sed 's/^/  /'
+            echo "Fix them, or add a justified statement to $VEX_EXCEPTIONS."
+            exit 1
+          fi
+          echo "govulncheck: no unwaived reachable vulnerabilities"
+
+      # Gate 2: module-level CVEs, at grype's strictest threshold.
+      #
+      # --only-fixed is deliberately NOT used: vulnerabilities with no
+      # upstream fix still block a release, and are waived individually via
+      # VEX rather than ignored as a class.
+      #
+      # Build/tool caches MUST be excluded: `grype dir:.` walks every file
+      # including third-party binaries the Makefile downloads into
+      # git-ignored dirs, and findings traced to those binaries are
+      # unactionable (the fix owner cannot bump a dependency inside a
+      # prebuilt lint binary that never ships in the provider image) and
+      # order-dependent (clean on a fresh checkout, dirty once
+      # `make lint`/`make reviewable` has populated `.cache/`).
+      - name: "Gate: grype (module-level CVEs)"
+        run: |
+          VEX_ARGS=()
+          if [ -f "$VEX_EXCEPTIONS" ]; then
+            VEX_ARGS=(--vex "$VEX_EXCEPTIONS")
+          fi
+          grype dir:. --fail-on "$GRYPE_FAIL_ON" "${VEX_ARGS[@]}" -q \
+            --exclude './.cache/**' \
+            --exclude './_output/**' \
+            --exclude './.work/**' \
+            --exclude './bin/**'
+
+      # Gate 3: no GPL-family licenses in the dependency tree.
+      #
+      # cyclonedx-gomod records detected licenses under .evidence.licenses,
+      # not .licenses -- reading the latter yields nothing, which silently
+      # turns this gate into a no-op. Both paths are read, and a zero total
+      # is treated as a failure so a future output-shape change surfaces as
+      # a broken gate instead of a passing one.
+      - name: "Gate: license compliance"
+        run: |
+          cyclonedx-gomod mod -json -licenses -output /tmp/sbom-licenses.json
+
+          jq -r '.components[]?
+                 | ((.licenses // []) + (.evidence.licenses // []))[]
+                 | (.license.id // .license.name // .expression // empty)' \
+            /tmp/sbom-licenses.json | sort > /tmp/licenses.txt
+
+          TOTAL=$(wc -l < /tmp/licenses.txt | tr -d ' ')
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "::error::no licenses detected at all -- the license gate is not actually checking anything"
+            exit 1
+          fi
+          echo "Detected $TOTAL license declaration(s):"
+          uniq -c /tmp/licenses.txt | sed 's/^/  /'
+
+          # Not ^-anchored: the jq above deliberately harvests SPDX
+          # `.expression` values too, so "MIT OR GPL-3.0-only" and
+          # "Apache-2.0 AND LGPL-2.1-or-later" must match. The second
+          # alternative catches free-text `.license.name` forms such as
+          # "GNU Lesser General Public License v2.1".
+          if grep -iE '(^|[^A-Za-z0-9.-])(A|L)?GPL|GNU (Lesser |Affero )?General Public' /tmp/licenses.txt; then
+            echo "::error::GPL-family license detected in dependency tree"
+            exit 1
+          fi
+
+          # Not fatal, but worth surfacing: a module whose license could not
+          # be determined is an unreviewed compliance risk.
+          UNKNOWN=$(jq -r '.components[]?
+                           | select(((.licenses // []) + (.evidence.licenses // [])) | length == 0)
+                           | .name' /tmp/sbom-licenses.json)
+          if [ -n "$UNKNOWN" ]; then
+            echo "::warning::modules with no detectable license:"
+            printf '%s\n' "$UNKNOWN" | sed 's/^/  /'
+          fi
+
+          echo "License check passed — no GPL-family licenses found"
+
+      # ── Artifact generation (all blocking) ────────────────────────
+      # These used to be best-effort. A release that silently ships without
+      # an SBOM or VEX is the failure mode the whole workflow exists to
+      # prevent, so generation failures now fail the release.
+      - name: Generate CycloneDX SBOM (Go modules)
+        run: cyclonedx-gomod mod -json -licenses -output sbom.cdx.json
+
+      - name: Generate OpenVEX (govulncheck reachability)
+        run: govulncheck -format openvex ./... > vex.openvex.json
+
+      # govulncheck has no flag for the OpenVEX author field and documents that
+      # it leaves it as "Unknown Author" "to be filled in by the user". The
+      # OpenVEX spec requires author, wants a machine-readable identifier, and
+      # wants it associated with the signing identity -- so derive it from the
+      # repository owner, which is also what the keyless cosign OIDC identity
+      # resolves to. Hardcoding an org would go stale on a repo transfer.
+      - name: Set OpenVEX author
+        run: |
+          jq --arg a "https://github.com/${{ github.repository_owner }}" \
+             --arg r "Project Release Bot" \
+             '.author = $a | .role = $r' \
+             vex.openvex.json > vex.openvex.json.tmp
+          mv vex.openvex.json.tmp vex.openvex.json
+
+          jq -e '.author != null and .author != "" and .author != "Unknown Author"' \
+            vex.openvex.json > /dev/null
+
+      # OpenVEX makes `.statements` a REQUIRED field. govulncheck omits the
+      # key entirely on a zero-finding scan -- a semantically clean scan, but
+      # a spec-invalid document that a strict parser may reject outright, and
+      # indistinguishable from a truncated generation to anyone holding only
+      # the artifact. Normalize the absence into an explicit empty array
+      # before this file is uploaded or attested, so the bytes that ship are
+      # the bytes checked here.
+      - name: Normalize and validate OpenVEX statements
+        run: |
+          TMP=$(mktemp)
+          jq '.statements //= []' vex.openvex.json > "$TMP" && mv "$TMP" vex.openvex.json
+          jq -e 'has("statements")' vex.openvex.json > /dev/null
+
+      # vens scores findings against this provider's deployment context
+      # (security/vens-config.yaml) using OWASP Risk Rating, and emits
+      # CycloneDX VEX. It needs OPENAI_API_KEY; the key is checked
+      # explicitly so a missing secret surfaces as a clear error rather than
+      # a confusing tool failure.
+      - name: Generate risk-scored VEX (vens)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ ! -f "$VENS_CONFIG" ]; then
+            echo "::error::$VENS_CONFIG not found -- risk scoring is part of the release contract"
+            exit 1
+          fi
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY is not set, so vens cannot score findings."
+            echo "Set the secret, or drop this step if risk scoring is not wanted."
+            exit 1
+          fi
+          # No `|| true`. --fail-on is deliberately not set on this invocation,
+          # so a non-zero exit here is a genuine error (DB fetch, OOM, rate
+          # limit) rather than a finding. Swallowing it let vens score an
+          # absent or truncated report and publish a VEX asserting nothing --
+          # indistinguishable from a clean assessment, then attested to the
+          # image and attached to the release.
+          #
+          # Same cache exclusions as Gate 2 above, for the same reason: this
+          # report is attested to the published image, so it must describe
+          # the provider's own dependency tree, not third-party toolchain
+          # binaries the Makefile downloads into git-ignored dirs and that
+          # never ship in that image.
+          grype dir:. -o json --file grype-report.json -q \
+            --exclude './.cache/**' \
+            --exclude './_output/**' \
+            --exclude './.work/**' \
+            --exclude './bin/**'
+          if ! jq -e '.matches | type == "array"' grype-report.json >/dev/null; then
+            echo "::error::grype report is not a usable document, refusing to risk-score it"
+            exit 1
+          fi
+
+          # --sbom-serial-number is REQUIRED and its value is not free-form: vens
+          # uses it to build the BOM-Link (urn:cdx:<uuid>/<version>#<bom-ref>)
+          # references inside the generated VEX, so each `affects` entry resolves
+          # back to "the CycloneDX SBOM paired with this scan" (vens's own docs,
+          # reference/generate/#--sbom-serial-number-urnuuid). A freshly minted
+          # random UUID is paired with nothing -- no SBOM anywhere carries that
+          # serial number, so a policy engine correlating this VEX against
+          # sbom.cdx.json (generated above, the CycloneDX SBOM of the same source
+          # tree grype just scanned) finds no match and passes vacuously. Reuse
+          # that SBOM's own serialNumber instead.
+          SBOM_SERIAL=$(jq -r '.serialNumber // empty' sbom.cdx.json)
+          if [ -z "$SBOM_SERIAL" ]; then
+            echo "::error::sbom.cdx.json has no .serialNumber -- cannot pair the risk-scored VEX to it"
+            exit 1
+          fi
+
+          vens generate \
+            --config-file "$VENS_CONFIG" \
+            --sbom-serial-number "$SBOM_SERIAL" \
+            --input-format grype \
+            grype-report.json \
+            risk-scored.vex.json
+
+          # vens can omit `.vulnerabilities` entirely, or emit it empty, when
+          # it scores nothing -- indistinguishable from a truncated run to a
+          # consumer holding only the artifact. Normalize absence into an
+          # explicit empty array before this file is uploaded or attested.
+          TMP=$(mktemp)
+          jq '.vulnerabilities //= []' risk-scored.vex.json > "$TMP" && mv "$TMP" risk-scored.vex.json
+          jq -e 'has("vulnerabilities")' risk-scored.vex.json > /dev/null
+
+          # The actual integrity property: if grype found something, vens
+          # must have scored something. This is what the presence checks
+          # above cannot catch -- vens silently scoring nothing while grype
+          # found matches would ship a VEX asserting a clean bill of health
+          # over a dirty scan.
+          GRYPE_MATCHES=$(jq '.matches | length' grype-report.json)
+          VEX_VULNS=$(jq '.vulnerabilities | length' risk-scored.vex.json)
+          if [ "$GRYPE_MATCHES" -gt 0 ] && [ "$VEX_VULNS" -eq 0 ]; then
+            echo "::error::grype found $GRYPE_MATCHES match(es) but risk-scored.vex.json carries zero vulnerabilities -- vens likely scored nothing"
+            exit 1
+          fi
+
+      - name: Upload security artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-artifacts
+          if-no-files-found: error
+          path: |
+            sbom.cdx.json
+            vex.openvex.json
+            risk-scored.vex.json
+
+  # ════════════════════════════════════════════════════════════════════
+  # Build and publish. Only reachable once the gate is green.
+  # ════════════════════════════════════════════════════════════════════
+  build-and-push:
+    needs: [resolve, security-gate]
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.pushed.outputs.digest }}
+    steps:
+      # Fail fast and loudly on missing credentials. Previously each
+      # credential-consuming step was individually skipped when secrets were
+      # absent, which produced a green run that quietly published nothing.
+      - name: Check credentials
+        run: |
+          MISSING=""
+          [ -n "$UP_API_TOKEN" ] || MISSING="$MISSING UP_API_TOKEN"
+          [ -n "$UP_ORG" ]       || MISSING="$MISSING UP_ORG"
+          [ -n "$UP_ROBOT_ID" ]  || MISSING="$MISSING UP_ROBOT_ID"
+          if [ -n "$MISSING" ]; then
+            echo "::error::missing required secret(s):$MISSING"
+            exit 1
+          fi
+
+      - name: Cleanup Disk
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          large-packages: false
+          swap-storage: false
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+        with:
+          platforms: all
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          version: ${{ env.DOCKER_BUILDX_VERSION }}
+          install: true
+
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: true
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      # The build submodule derives VERSION from `git describe`, which needs
+      # the full history and all tags.
+      - name: Fetch History
+        run: git fetch --prune --unshallow
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install and login with up
+        uses: upbound/action-up@2c4d9663b902087b0808b79fe2c7ec68424d87d8 # v1.2.0
+        with:
+          api-token: ${{ secrets.UP_API_TOKEN }}
+          organization: ${{ secrets.UP_ORG }}
+
+      # The up login above is NOT sufficient to push. UP_API_TOKEN is a robot
+      # token, and up's RegistryKeychain explicitly falls back to the Docker
+      # keychain for robot tokens ("robot tokens cannot be used for registry
+      # login 401 Unauthorized"), so the push credentials must come from a
+      # docker login. The robot id is the username.
+      - name: Login to xpkg with robot
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ${{ env.XPKG_REGISTRY }}
+          username: ${{ env.UP_ROBOT_ID }}
+          password: ${{ env.UP_API_TOKEN }}
+
+      - name: Vendor Dependencies
+        run: make vendor vendor.check
+
+      # VERSION is always passed explicitly from the resolved tag rather than
+      # left to `git describe`, so a dispatch run and a tag push produce
+      # identically versioned artifacts.
+      - name: Build Artifacts
+        run: make -j2 build.all VERSION=${{ needs.resolve.outputs.tag }}
+        env:
+          # We're using docker buildx, which doesn't actually load the images
+          # it builds by default. Specifying --load does so.
+          BUILD_ARGS: "--load"
+
+      - name: Publish Artifacts to GitHub
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: output
+          path: _output/**
+
+      - name: Push Package to xpkg.upbound.io
+        run: make xpkg.push.up VERSION=${{ needs.resolve.outputs.tag }}
+
+      # Record exactly what was pushed. The attest job re-resolves the tag and
+      # refuses to continue if it no longer points here, which is the only way
+      # to notice that something else wrote to the tag in between.
+      - name: Resolve Pushed Digest
+        id: pushed
+        run: |
+          set -euo pipefail
+          DIGEST=$(docker buildx imagetools inspect "${XPKG_IMAGE}:${TAG}" | awk '/^Digest:/{print $2}')
+          if [ -z "$DIGEST" ]; then
+            echo "::error::could not resolve digest for ${XPKG_IMAGE}:${TAG} after push"
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "pushed ${XPKG_IMAGE}@${DIGEST}"
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+
+  # ════════════════════════════════════════════════════════════════════
+  # Sign and attest the published image, and append Marketplace assets.
+  # ════════════════════════════════════════════════════════════════════
+  attest:
+    needs: [resolve, build-and-push]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      # Buildx is used only for `imagetools inspect` to resolve the published
+      # digest -- a registry API call, so no QEMU/emulation is needed here.
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # The action SHA pins the installer, not the cosign binary it downloads
+      # -- sigstore/cosign-installer defaults cosign-release to whatever its
+      # maintainers currently ship, which can move between releases with no
+      # change to this file. cosign v3.x already moved attestations from
+      # .sig/.att tags to OCI 1.1 referrers; an unpinned installer could shift
+      # the attestation format again with nothing here to catch it. Pin the
+      # cosign version explicitly so it only moves on a deliberate bump here.
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v3.0.6'
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        id: syft-install
+
+      - name: Download security artifacts
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.2.1
+        with:
+          name: security-artifacts
+
+      - name: Install and login with up
+        uses: upbound/action-up@2c4d9663b902087b0808b79fe2c7ec68424d87d8 # v1.2.0
+        with:
+          api-token: ${{ secrets.UP_API_TOKEN }}
+          organization: ${{ secrets.UP_ORG }}
+
+      - name: Login to xpkg with robot
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ${{ env.XPKG_REGISTRY }}
+          username: ${{ env.UP_ROBOT_ID }}
+          password: ${{ env.UP_API_TOKEN }}
+
+      # Confirm the tag still resolves to what build-and-push pushed before
+      # anything is derived from it. Everything downstream then works from
+      # $PUBLISHED_IMAGE (an immutable digest reference), never the tag.
+      - name: Verify Pushed Digest Unchanged
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          EXPECTED: ${{ needs.build-and-push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::build-and-push did not report a digest"
+            exit 1
+          fi
+          ACTUAL=$(docker buildx imagetools inspect "${XPKG_IMAGE}:${TAG}" | awk '/^Digest:/{print $2}')
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::${XPKG_IMAGE}:${TAG} changed since it was pushed"
+            echo "  pushed: $EXPECTED"
+            echo "  now:    $ACTUAL"
+            exit 1
+          fi
+          echo "PRE_APPEND_IMAGE=${XPKG_IMAGE}@${EXPECTED}" >> "$GITHUB_ENV"
+
+      # This SBOM becomes the Marketplace `sbom` extension, so it necessarily
+      # describes the image as it exists *before* `xpkg append` -- appending
+      # the SBOM is itself what changes the image, so an extension SBOM can
+      # never describe its own result. The SBOM that gets attested is a
+      # separate, post-append one generated further down; that is the one
+      # describing what a consumer actually pulls.
+      - name: Generate xpkg SBOM (SPDX — pre-append, for Marketplace)
+        run: ${{ steps.syft-install.outputs.cmd }} "$PRE_APPEND_IMAGE" -o spdx-json=xpkg-sbom.spdx.json
+
+      # The GitHub Release is created by the `release` job, i.e. after this
+      # one, so `gh release view` would find nothing. Notes are assembled here
+      # instead; the same file becomes the Marketplace release-notes extension
+      # and the Release body.
+      #
+      # hack/release-notes.sh reads the `release-note` blocks contributors
+      # write in their pull request descriptions, rather than GitHub's
+      # generate-notes API, which renders one bullet per pull request from the
+      # pull request TITLE. Reading descriptions decouples how work is grouped
+      # into pull requests from how much detail the notes can carry: a single
+      # pull request carrying a batch of changes documents each one, where a
+      # title-derived bullet names none of them.
+      #
+      # It falls back to generate-notes rather than failing. A repository that
+      # has not adopted the format, or a release window the script cannot
+      # resolve, still gets exactly the notes it would have had before.
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          if ! ./hack/release-notes.sh "${{ needs.resolve.outputs.tag }}" > release_notes.md; then
+            echo "::warning::hack/release-notes.sh produced no notes for ${{ needs.resolve.outputs.tag }}, falling back to generate-notes"
+            gh api "repos/${{ github.repository }}/releases/generate-notes" \
+              -f tag_name="${{ needs.resolve.outputs.tag }}" \
+              --jq .body > release_notes.md 2>/dev/null || true
+          fi
+          # The file must always exist and be non-empty: it is both a
+          # Marketplace extension and the Release body_path, and a missing
+          # file would fail the release job rather than degrade gracefully.
+          if [ ! -s release_notes.md ]; then
+            echo "::warning::could not generate release notes for ${{ needs.resolve.outputs.tag }}, falling back to a placeholder"
+            echo "Release ${{ needs.resolve.outputs.tag }}." > release_notes.md
+          fi
+          echo "--- assembled release notes ---"
+          cat release_notes.md
+
+      # Source is the verified digest, destination is the tag, both stated
+      # explicitly. `--destination` otherwise defaults to "modify the input
+      # reference", which is not a meaningful target for a digest -- a digest
+      # is content-addressed and cannot be written to.
+      - name: Append package assets for Marketplace
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          extensions_dir=${{ github.workspace }}/extensions
+          mkdir -p $extensions_dir/sbom
+          cp ./xpkg-sbom.spdx.json $extensions_dir/sbom/sbom.spdx.json
+          mkdir -p $extensions_dir/readme
+          cp ./README.md $extensions_dir/readme/readme.md
+          mkdir -p $extensions_dir/release-notes
+          if [ -f ./release_notes.md ]; then
+            cp ./release_notes.md $extensions_dir/release-notes/
+          fi
+          up alpha xpkg append "$PRE_APPEND_IMAGE" \
+            --destination "${XPKG_IMAGE}:${TAG}" \
+            --extensions-root $extensions_dir
+
+      # `xpkg append` rewrites and re-pushes the image, so the tag now points
+      # somewhere new. Resolve that digest ONCE here and pin every subsequent
+      # operation to it. Previously each of the eight registry calls below
+      # re-resolved the mutable tag independently, so in principle they could
+      # sign, attest and describe different images.
+      - name: Resolve Published Digest
+        id: xpkg-digest
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          DIGEST=$(docker buildx imagetools inspect "${XPKG_IMAGE}:${TAG}" | awk '/^Digest:/{print $2}')
+          if [ -z "$DIGEST" ]; then
+            echo "::error::could not resolve digest for ${XPKG_IMAGE}:${TAG}"
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "PUBLISHED_IMAGE=${XPKG_IMAGE}@${DIGEST}" >> "$GITHUB_ENV"
+          echo "publishing ${XPKG_IMAGE}@${DIGEST}"
+
+      # Generated against the post-append digest, so this describes exactly
+      # what a consumer pulls -- unlike the Marketplace extension SBOM above,
+      # which is necessarily pre-append. This is the SBOM that gets attested.
+      - name: Generate xpkg SBOM (SPDX — published image)
+        run: ${{ steps.syft-install.outputs.cmd }} "$PUBLISHED_IMAGE" -o spdx-json=xpkg-sbom.published.spdx.json
+
+      # Signing and attestation come after `xpkg append`: appending extensions
+      # rewrites and re-pushes the image, so anything signed beforehand would
+      # reference a digest that is no longer what the tag resolves to.
+      - name: Sign xpkg Image
+        run: cosign sign --yes "$PUBLISHED_IMAGE"
+
+      - name: Attest SBOM to xpkg Image (SPDX)
+        run: cosign attest --yes --predicate xpkg-sbom.published.spdx.json --type spdxjson "$PUBLISHED_IMAGE"
+
+      - name: Attest SBOM to xpkg Image (CycloneDX)
+        run: cosign attest --yes --predicate sbom.cdx.json --type cyclonedx "$PUBLISHED_IMAGE"
+
+      - name: Attest VEX to xpkg Image (OpenVEX)
+        run: cosign attest --yes --predicate vex.openvex.json --type openvex "$PUBLISHED_IMAGE"
+
+      # vens emits CycloneDX VEX, not OpenVEX. It must NOT reuse cosign's
+      # `cyclonedx` alias: that resolves to predicate type
+      # https://cyclonedx.org/bom, which the CycloneDX SBOM above already
+      # claims. Two attestations sharing one predicate type means a policy
+      # engine asking for "the CycloneDX SBOM" can be handed this VEX instead
+      # and pass vacuously -- it has no .components to find anything wrong in.
+      # A distinct URI makes the two selectable, so a query for the SBOM can
+      # only ever return the SBOM.
+      - name: Attest risk-scored VEX to xpkg Image (CycloneDX VEX)
+        run: cosign attest --yes --predicate risk-scored.vex.json --type https://cyclonedx.org/vex "$PUBLISHED_IMAGE"
+
+      # Every risk score in risk-scored.vex.json derives from the three
+      # assumptions vens-config.yaml declares (exposure, data sensitivity,
+      # network segmentation). Attesting it as its own predicate lets a
+      # customer under different conditions see that those scores do not
+      # apply to them, rather than reading them as universal. Its own
+      # predicate type -- distinct from all five other attestations here --
+      # keeps a policy engine asking for "the CycloneDX VEX" from being
+      # handed this context document instead.
+      - name: Attest vens risk-scoring context to xpkg Image
+        run: |
+          set -euo pipefail
+          yq -o=json '.' "$VENS_CONFIG" > vens-config.json
+          cosign attest --yes --predicate vens-config.json --type https://vens.dev/risk-context/v1 "$PUBLISHED_IMAGE"
+
+      # actions/attest-build-provenance is the purpose-built action for SLSA
+      # provenance (actions/attest, used here previously, is the generic
+      # "Generate Generic Attestations" action, and named nothing about
+      # SLSA at all -- it happened to still auto-detect "Provenance" mode
+      # because no predicate/predicate-type/sbom-path input was supplied,
+      # which is documented action behavior, not an assumption). The bundle
+      # this writes is a GitHub attestations-API referrer, which `gh
+      # attestation verify` discovers natively but cosign's OCI-referrer
+      # discovery does not enumerate -- that gap is why every other
+      # attestation on this image is `cosign attest`, not this action, and
+      # why the step below re-attests the identical predicate through
+      # cosign so the ladder verifies with one tool end to end.
+      - name: Attest SLSA Provenance to xpkg Image
+        id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.XPKG_IMAGE }}
+          subject-digest: ${{ steps.xpkg-digest.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      # Sources the predicate from the action's own bundle-path output, not
+      # a second, independently-generated provenance document -- one
+      # predicate, attested twice, rather than two predicates that could
+      # diverge. `slsaprovenance1` (not `slsaprovenance`, which is the
+      # cosign alias for SLSA v0.2) is the correct alias for the v1
+      # predicate actions/attest-build-provenance produces; verify-release.sh
+      # and the README verification section both check this same alias.
+      - name: Attest SLSA Provenance to xpkg Image via cosign (cosign-discoverable)
+        run: |
+          set -euo pipefail
+          jq -r '.dsseEnvelope.payload | @base64d | fromjson | .predicate' \
+            "${{ steps.provenance.outputs.bundle-path }}" > provenance.predicate.json
+          cosign attest --yes --predicate provenance.predicate.json --type slsaprovenance1 "$PUBLISHED_IMAGE"
+
+      # Hand everything the release job needs across as one artifact, so it
+      # does not have to re-derive the container SBOM or the notes.
+      - name: Upload release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          if-no-files-found: error
+          path: |
+            sbom.cdx.json
+            xpkg-sbom.spdx.json
+            xpkg-sbom.published.spdx.json
+            vex.openvex.json
+            risk-scored.vex.json
+            release_notes.md
+            security/vens-config.yaml
+            security/vex-exceptions.openvex.json
+
+  # ════════════════════════════════════════════════════════════════════
+  # Publish the GitHub Release. Last, so a Release only ever exists for a
+  # version that passed the gate and is signed in the registry.
+  # ════════════════════════════════════════════════════════════════════
+  release:
+    needs: [resolve, attest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.2.1
+        with:
+          name: release-assets
+
+      # Anything carrying a pre-release suffix (-rc1, -alpha.1, -beta) is marked
+      # as a pre-release, so a throwaway or candidate build is not presented as
+      # the latest stable release on the repository front page.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: ${{ needs.resolve.outputs.tag }}
+          body_path: release_notes.md
+          prerelease: ${{ contains(needs.resolve.outputs.tag, '-') }}
+          files: |
+            sbom.cdx.json
+            xpkg-sbom.spdx.json
+            xpkg-sbom.published.spdx.json
+            vex.openvex.json
+            risk-scored.vex.json
+            security/vens-config.yaml
+            security/vex-exceptions.openvex.json

@@ -17,22 +17,22 @@ limitations under the License.
 package v1alpha1
 
 import (
-	xpv1 "github.com/crossplane/crossplane/apis/v2/core/v2"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // A ProviderConfigStatus defines the status of a Provider.
 type ProviderConfigStatus struct {
-	xpv1.ProviderConfigStatus `json:",inline"`
+	xpv2.ProviderConfigStatus `json:",inline"`
 }
 
 // ProviderCredentials required to authenticate via SSH.
 type ProviderCredentials struct {
 	// Source of the provider credentials.
 	// +kubebuilder:validation:Enum=None;Secret
-	Source xpv1.CredentialsSource `json:"source"`
+	Source xpv2.CredentialsSource `json:"source"`
 
-	xpv1.CommonCredentialSelectors `json:",inline"`
+	xpv2.CommonCredentialSelectors `json:",inline"`
 }
 
 // ProviderConfigSpec defines the desired state of ProviderConfig.
@@ -87,7 +87,7 @@ type ProviderConfigUsage struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	xpv1.TypedProviderConfigUsage `json:",inline"`
+	xpv2.TypedProviderConfigUsage `json:",inline"`
 }
 
 // +kubebuilder:object:root=true

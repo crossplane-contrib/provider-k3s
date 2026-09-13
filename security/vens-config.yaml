@@ -1,0 +1,54 @@
+# vens configuration — contextual risk scoring for supply chain security
+#
+# This file describes the provider's deployment context so vens can score
+# CVEs using OWASP Risk Rating instead of just generic CVSS.
+#
+# Customize the values below for your provider. See:
+# https://venslabs.github.io/vens/guides/configuration/
+
+project:
+  name: "provider-k3s"
+  description: "Crossplane provider managing k3s clusters and nodes over SSH"
+
+context:
+  # Where does this software run?
+  # internal = private network only
+  # private  = VPN / authenticated access
+  # internet = publicly reachable
+  #
+  # The controller reaches every managed host over SSH using a key or
+  # password from a Kubernetes Secret — authenticated access to hosts that
+  # are not otherwise exposed by this provider.
+  exposure: "private"
+
+  # What kind of data does it handle?
+  # low      = public data
+  # medium   = internal business data
+  # high     = PII, credentials, financial data
+  # critical = classified, regulated (HIPAA, PCI-DSS)
+  #
+  # SSH private keys, kubeconfigs and node-join tokens all pass through this
+  # provider's reconcile loop and connection-detail publishing.
+  data_sensitivity: "high"
+
+  # How important is this to the business?
+  # low      = nice to have
+  # medium   = supports business operations
+  # high     = core infrastructure
+  # critical = revenue-critical, SLA-bound
+  business_criticality: "high"
+
+  # Compliance frameworks that apply
+  compliance_requirements:
+    - "SOC2"
+    # - "GDPR"
+    # - "HIPAA"
+    # - "PCI-DSS"
+    # - "FedRAMP"
+
+  # Security controls already in place
+  controls:
+    waf: false
+    network_segmentation: true    # k8s namespace isolation
+    # mfa: true
+    # encryption_at_rest: true

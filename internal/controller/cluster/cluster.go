@@ -42,12 +42,12 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 }
 
 // SetupGated creates all cluster-scoped k3s controllers with SafeStart capability.
+// ProviderConfig is never gated — it is always present, so it is set up
+// unconditionally on this path too, exactly as it is on the ungated Setup path.
 func SetupGated(mgr ctrl.Manager, o controller.Options) error {
-	o.Gate.Register(func() {
-		if err := config.Setup(mgr, o); err != nil {
-			panic(err)
-		}
-	}, clusterv1alpha1.ProviderConfigGroupVersionKind)
+	if err := config.Setup(mgr, o); err != nil {
+		return err
+	}
 
 	o.Gate.Register(func() {
 		if err := cluster.Setup(mgr, o); err != nil {

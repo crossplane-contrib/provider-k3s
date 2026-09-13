@@ -1,0 +1,74 @@
+name: Tag
+
+# Dispatching this workflow is the single human gate on a release: it creates
+# the tag and then hands off to release.yaml, which gates, builds, publishes,
+# signs and attests without further intervention.
+#
+# The handoff is an explicit workflow_dispatch rather than release.yaml
+# reacting to the tag push. GitHub does not start new workflow runs from events
+# created by GITHUB_TOKEN -- workflow_dispatch and repository_dispatch are the
+# only exceptions -- so the push performed by the Create Tag step below is
+# invisible to a `on: push: tags` trigger. Verified on this repository: tag
+# v0.2.1-rc1 was created by this workflow and produced no release.yaml run.
+#
+# The alternative would be a PAT or GitHub App token on the Create Tag step, so
+# that the push is attributed to a real identity and does trigger. That buys
+# nothing here and costs a credential to store and rotate, so the dispatch is
+# preferred.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. v0.1.0)'
+        required: true
+      message:
+        description: 'Tag message'
+        required: true
+
+permissions:
+  contents: write   # create the tag
+  actions: write    # dispatch release.yaml
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Create Tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.event.inputs.version }}
+          MESSAGE: ${{ github.event.inputs.message }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "$MESSAGE"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$VERSION"
+
+      # Hand off to the release pipeline, dispatched against the tag rather
+      # than the default branch. The Fulcio certificate on release.yaml's OIDC
+      # identity records the ref this dispatch names, not the ref release.yaml
+      # happens to check out internally -- dispatching against the branch
+      # makes every release share one cert SAN
+      # (.../release.yaml@refs/heads/main), so a customer can never pin a
+      # version, and the SLSA predicate can name a commit that release.yaml
+      # never actually built once the tag and the branch diverge. Dispatching
+      # against the tag means the workflow *definition* also comes from the
+      # tag, so a broken release.yaml at an old tag can only be fixed by
+      # re-tagging -- accepted because SLSA wants the build definition pinned
+      # to the same revision as the source.
+      - name: Start Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          gh workflow run release.yaml \
+            --repo "$REPO" \
+            --ref "$VERSION" \
+            -f version="$VERSION"
+          echo "Dispatched release.yaml for $VERSION"

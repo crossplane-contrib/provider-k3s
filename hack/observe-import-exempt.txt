@@ -1,0 +1,17 @@
+# Fields exempted from convention 0032's "create-time inputs are gated by
+# managementPolicies, not unconditionally required" rule, because Observe()
+# genuinely needs them to address the object -- an Observe-only apply
+# cannot function without them, so relaxing them to optional would not help
+# adoption, only break Observe.
+#
+# One field name per line, with the reason it is part of the address.
+
+# host: the SSH connection target. It is the sole identity this provider
+# has for a Cluster or a Node (there is no server-assigned or generator
+# external-name anywhere in this provider) -- Observe's existence probe
+# (systemctl is-active over SSH) cannot run without it, and Connect()
+# builds the SSH client from it directly. Deterministic, stable identity:
+# see the External-Name Strategy discussion in
+# internal/controller/cluster/cluster/cluster.go and
+# internal/controller/cluster/node/node.go.
+host

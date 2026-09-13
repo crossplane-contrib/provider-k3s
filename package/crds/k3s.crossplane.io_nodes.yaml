@@ -71,12 +71,63 @@ spec:
                 - Orphan
                 - Delete
                 type: string
+              driftDetection:
+                description: |-
+                  DriftDetection configures which forProvider fields are owned outside
+                  Crossplane and how drift in those fields is detected and corrected.
+                  Absent configuration means drift detection is enabled with no
+                  ignored paths -- today's behaviour.
+                properties:
+                  ignore:
+                    description: Ignore declares fields owned outside Crossplane.
+                    items:
+                      description: |-
+                        IgnoreRule declares fields whose value is owned by something other than
+                        Crossplane. Listed fields are seeded from spec on create, then neither
+                        compared nor written from spec: the value observed on the external
+                        resource is carried forward instead.
+                      properties:
+                        paths:
+                          description: |-
+                            Paths to ignore, in Crossplane field path notation rooted at the
+                            managed resource spec, for example forProvider.k3sVersion. This is
+                            the grammar Composition patches use; JSON Pointer form
+                            (/forProvider/k3sVersion) is also accepted. List indices and
+                            wildcards are not supported -- ignore the whole list instead.
+                          items:
+                            type: string
+                          type: array
+                      type: object
+                    type: array
+                  mode:
+                    default: enabled
+                    description: Mode selects the drift detection behaviour.
+                    enum:
+                    - enabled
+                    - warn
+                    - disabled
+                    type: string
+                type: object
               forProvider:
                 description: NodeParameters are the configurable fields of a Node.
                 properties:
+                  cluster:
+                    description: |-
+                      Cluster is the resolved Kubernetes object name of the Cluster this
+                      node joins, populated from ClusterRef or ClusterSelector. Changing
+                      the resolved cluster after creation would mean leaving one cluster
+                      and joining another, which this provider does not attempt as an
+                      in-place update.
+                    type: string
+                    x-kubernetes-validations:
+                    - message: cluster is immutable once set
+                      rule: self == oldSelf || oldSelf == ''
                   clusterRef:
-                    description: ClusterRef is a reference to the Cluster resource
-                      this node joins.
+                    description: |-
+                      ClusterRef references the Cluster resource this node joins, by name.
+                      Required when managementPolicies allows Create or Update (see the
+                      root-level CEL rule on Node) unless clusterSelector is set instead --
+                      Observe only needs host to address the object, per convention.
                     properties:
                       name:
                         description: Name of the referenced object.
@@ -109,13 +160,63 @@ spec:
                     required:
                     - name
                     type: object
+                    x-kubernetes-validations:
+                    - message: clusterRef is immutable after creation
+                      rule: self == oldSelf
+                  clusterSelector:
+                    description: |-
+                      ClusterSelector selects the Cluster resource this node joins, by
+                      label match.
+                    properties:
+                      matchControllerRef:
+                        description: |-
+                          MatchControllerRef ensures an object with the same controller reference
+                          as the selecting object is selected.
+                        type: boolean
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: MatchLabels ensures an object with matching labels
+                          is selected.
+                        type: object
+                      policy:
+                        description: Policies for selection.
+                        properties:
+                          resolution:
+                            default: Required
+                            description: |-
+                              Resolution specifies whether resolution of this reference is required.
+                              The default is 'Required', which means the reconcile will fail if the
+                              reference cannot be resolved. 'Optional' means this reference will be
+                              a no-op if it cannot be resolved.
+                            enum:
+                            - Required
+                            - Optional
+                            type: string
+                          resolve:
+                            description: |-
+                              Resolve specifies when this reference should be resolved. The default
+                              is 'IfNotPresent', which will attempt to resolve the reference only when
+                              the corresponding field is not present. Use 'Always' to resolve the
+                              reference on every reconcile.
+                            enum:
+                            - Always
+                            - IfNotPresent
+                            type: string
+                        type: object
+                    type: object
                   extraArgs:
                     description: ExtraArgs are additional arguments passed to k3s.
                     type: string
                   host:
-                    description: Host is the DNS name or IP address of the target
-                      machine.
+                    description: |-
+                      Host is the DNS name or IP address of the target machine. It is the
+                      SSH connection target and the sole identity this provider has for the
+                      joined node; it cannot be changed after creation.
                     type: string
+                    x-kubernetes-validations:
+                    - message: host is immutable after creation
+                      rule: self == oldSelf
                   k3sChannel:
                     default: stable
                     description: K3sChannel is the release channel.
@@ -125,24 +226,44 @@ spec:
                     type: string
                   port:
                     default: 22
-                    description: Port is the SSH port. Defaults to 22.
+                    description: |-
+                      Port is the SSH port. Defaults to 22. It addresses the same SSH
+                      connection target as host and cannot be changed after creation.
                     type: integer
+                    x-kubernetes-validations:
+                    - message: port is immutable after creation
+                      rule: self == oldSelf
                   role:
-                    description: 'Role is the role of this node: "agent" (worker)
-                      or "server" (additional control plane).'
+                    description: |-
+                      Role is the role of this node: "agent" (worker) or "server" (additional control plane).
+                      Required when managementPolicies allows Create or Update (see the
+                      root-level CEL rule on Node) -- Observe only needs host to address
+                      the object. Switching a joined node's role requires leaving and
+                      rejoining, which this provider does not attempt as an in-place
+                      update.
                     enum:
                     - agent
                     - server
                     type: string
+                    x-kubernetes-validations:
+                    - message: role is immutable after creation
+                      rule: self == oldSelf
                   tlsSAN:
                     description: TLSSAN adds an additional TLS SAN (only applicable
                       for server role).
                     type: string
                 required:
-                - clusterRef
                 - host
-                - role
                 type: object
+                x-kubernetes-validations:
+                - message: port cannot be removed once set
+                  rule: '!has(oldSelf.port) || has(self.port)'
+                - message: clusterRef cannot be removed once set
+                  rule: '!has(oldSelf.clusterRef) || has(self.clusterRef)'
+                - message: cluster cannot be removed once set
+                  rule: '!has(oldSelf.cluster) || has(self.cluster)'
+                - message: role cannot be removed once set
+                  rule: '!has(oldSelf.role) || has(self.role)'
               managementPolicies:
                 default:
                 - '*'
@@ -235,12 +356,60 @@ spec:
               atProvider:
                 description: NodeObservation are the observable fields of a Node.
                 properties:
+                  cluster:
+                    description: |-
+                      Cluster mirrors spec.forProvider.cluster: the resolved Kubernetes
+                      object name of the Cluster this node joined. Immutable once set, so
+                      it cannot diverge from spec once the resource exists.
+                    type: string
+                  extraArgs:
+                    description: |-
+                      ExtraArgs mirrors the value this controller most recently confirmed
+                      it applied. Empty until the first successful Create or Update.
+                    type: string
+                  host:
+                    description: |-
+                      Host mirrors spec.forProvider.host: the SSH target this Node was
+                      joined on. Immutable, so it cannot diverge from spec once the
+                      resource exists.
+                    type: string
+                  id:
+                    description: |-
+                      ID is this resource's identity, mirrored from the external-name
+                      annotation once Observe or Create has run. Uptest's import recovery
+                      test compares this against the external-name recorded before the
+                      resource's status was cleared.
+                    type: string
+                  k3sChannel:
+                    description: |-
+                      K3sChannel mirrors the release channel this controller most
+                      recently confirmed it applied. Empty until the first successful
+                      Create or Update: the k3s join script reports no channel of its
+                      own, so there is nothing to mirror before this controller has
+                      recorded one.
+                    type: string
+                  k3sVersion:
+                    description: K3sVersion is the installed version reported by the
+                      node.
+                    type: string
+                  port:
+                    description: |-
+                      Port mirrors spec.forProvider.port. Immutable, so it cannot diverge
+                      from spec once the resource exists.
+                    type: integer
                   ready:
                     description: Ready indicates the node has successfully joined
                       the cluster.
                     type: boolean
                   role:
-                    description: Role is the observed role of the node.
+                    description: |-
+                      Role is the observed role of the node. Immutable, so it cannot
+                      diverge from spec once the resource exists.
+                    type: string
+                  tlsSAN:
+                    description: |-
+                      TLSSAN mirrors the value this controller most recently confirmed it
+                      applied. Empty until the first successful Create or Update.
                     type: string
                 type: object
               conditions:
@@ -307,6 +476,17 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: clusterRef or clusterSelector is required when managementPolicies
+            allows Create or Update
+          rule: '!has(self.spec) || !has(self.spec.managementPolicies) || !(''*''
+            in self.spec.managementPolicies || ''Create'' in self.spec.managementPolicies
+            || ''Update'' in self.spec.managementPolicies) || has(self.spec.forProvider.clusterRef)
+            || has(self.spec.forProvider.clusterSelector)'
+        - message: role is required when managementPolicies allows Create or Update
+          rule: '!has(self.spec) || !has(self.spec.managementPolicies) || !(''*''
+            in self.spec.managementPolicies || ''Create'' in self.spec.managementPolicies
+            || ''Update'' in self.spec.managementPolicies) || has(self.spec.forProvider.role)'
     served: true
     storage: true
     subresources:

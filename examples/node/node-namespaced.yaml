@@ -1,0 +1,39 @@
+apiVersion: k3s.m.crossplane.io/v1alpha1
+kind: Node
+metadata:
+  name: worker-1
+  namespace: crossplane-system
+spec:
+  forProvider:
+    host: k3s-nodepool-1.k3s-nodepool.crossplane-system.svc.cluster.local
+    port: 22
+    clusterRef:
+      name: my-k3s-cluster
+    role: agent
+    k3sChannel: stable
+---
+apiVersion: k3s.m.crossplane.io/v1alpha1
+kind: Cluster
+metadata:
+  name: my-k3s-cluster
+  namespace: crossplane-system
+spec:
+  forProvider:
+    host: k3s-nodepool-0.k3s-nodepool.crossplane-system.svc.cluster.local
+    port: 22
+    k3sChannel: stable
+    tlsSAN: k3s.example.com
+    disableTraefik: true
+    # A live run (2026-09-08) measured the default vxlan flannel backend
+    # failing deterministically on this fixture's host: journalctl showed
+    # "Starting flannel with backend vxlan" followed within ~1-3s by
+    # "Shutdown request received: flannel exited: failed to register
+    # flannel network: failed to create vxlan device: operation not
+    # supported" on EVERY single restart cycle (100% reproduction across
+    # 150+ cycles) -- the nested test host's kernel cannot create a vxlan
+    # netdevice. host-gw needs no tunnel device at all, routing directly
+    # over the existing L3 reachability between nodepool members, so it
+    # sidesteps the missing kernel capability entirely.
+    extraArgs: --flannel-backend=host-gw
+  writeConnectionSecretToRef:
+    name: k3s-cluster-kubeconfig

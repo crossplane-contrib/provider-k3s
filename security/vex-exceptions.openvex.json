@@ -1,0 +1,27 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/crossplane-contrib/provider-k3s/security/vex-exceptions.openvex.json",
+  "author": "provider-k3s security team",
+  "timestamp": "2026-09-09T10:32:00Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "GO-2026-5932",
+        "@id": "https://pkg.go.dev/vuln/GO-2026-5932"
+      },
+      "timestamp": "2026-09-09T10:32:00Z",
+      "products": [
+        {
+          "@id": "pkg:golang/github.com/crossplane-contrib/provider-k3s"
+        },
+        {
+          "@id": "pkg:golang/golang.org/x/crypto@v0.56.0"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "GO-2026-5932 is an advisory against golang.org/x/crypto/openpgp, which is unmaintained and unsafe by design. provider-k3s requires golang.org/x/crypto v0.56.0 directly, but only for SSH node provisioning: the x/crypto packages that reach this provider's build are golang.org/x/crypto/ssh and the primitives it pulls with it (blowfish, chacha20, curve25519, cryptobyte, internal/poly1305, ssh/internal/bcrypt_pbkdf). The openpgp package is not among them. Measured on provider-k3s at commit 90b16ca: `go list -deps ./...` returns zero packages matching openpgp, so the vulnerable code is not compiled into the provider binary at all -- it is not merely uncalled, it is not linked. govulncheck agrees at symbol level and reports 'Your code may be affected by 0 vulnerabilities', flagging GO-2026-5932 only as a module-level finding against a module this provider requires for an unrelated package. grype with --only-fixed returns 0 matches, consistent with the advisory carrying no fixed version. Risk accepted by Tobias Kaesser on 2026-09-09. No upstream fix exists (Fixed in: N/A) and none is expected -- the advisory's remedy is to stop using the package, which this provider already does not use. This exception is void the moment golang.org/x/crypto publishes a fixed version for this advisory, or the moment any openpgp package enters this provider's build graph."
+    }
+  ]
+}

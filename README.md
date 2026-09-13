@@ -143,12 +143,154 @@ resource itself. The ProviderConfig only holds the SSH identity (username +
 credentials), so a single ProviderConfig can be reused across multiple machines
 that share the same SSH user and key.
 
+## Drift Detection
+
+Every `Cluster` and `Node` accepts an optional `spec.driftDetection` block that
+controls how the controller reacts when the live host no longer matches the
+resource's desired configuration:
+
+```yaml
+apiVersion: k3s.crossplane.io/v1alpha1
+kind: Cluster
+metadata:
+  name: my-cluster
+spec:
+  driftDetection:
+    mode: enabled
+    ignore:
+      - paths:
+          - forProvider.k3sVersion
+  forProvider:
+    host: 192.168.1.100
+    port: 22
+    k3sChannel: stable
+  providerConfigRef:
+    name: ssh-ubuntu
+```
+
+`mode` selects the behaviour:
+
+- `enabled` (the default — a resource with no `driftDetection` block behaves
+  exactly as if this were set) — detect drift and correct it by re-running the
+  install/join command with the resource's declared configuration.
+- `warn` — detect drift and report it on the resource's `DriftDetected`
+  condition, but do not correct it.
+- `disabled` — neither detect nor correct drift.
+
+`ignore` lists `forProvider` fields that are owned by something other than
+Crossplane, in Crossplane field path notation (for example
+`forProvider.k3sVersion`) or as a JSON Pointer (`/forProvider/k3sVersion`). An
+ignored field is seeded from `spec` on create, and from then on the value last
+observed on the host is carried forward instead of being overwritten from
+`spec`. Fields the SSH target's own identity is derived from (`host`) can
+never be ignored.
+
+**How drift is measured on this provider.** The k3s install and join scripts
+return no introspectable server configuration — there is nothing to read back
+from the host and compare against `spec` directly. Instead, the controller
+records the mutable configuration it last sent to the host in an annotation
+and compares the resource's current `spec` against that record on every
+reconcile. This means drift detection here only catches configuration that
+diverged from what Crossplane itself last applied — a change made directly on
+the host outside of any k3s reconfiguration this provider performed (for
+example editing a systemd unit or a k3s config file by hand) is **not**
+detected, because the provider never re-reads the host's actual running
+configuration.
+
 ## Acknowledgements
 
 This provider is built on top of the patterns established by
 [k3sup](https://github.com/alexellis/k3sup) by Alex Ellis. k3sup provides the
 foundational approach of installing and joining k3s clusters over SSH, which this
 provider adapts into the Crossplane reconciliation model.
+
+## Releases and Support
+
+See [RELEASES.md](RELEASES.md) for the versioning scheme, which releases are
+supported, and what changes across an upgrade or a downgrade.
+
+## Verifying this package
+
+Every release publishes an image signature plus a full ladder of OCI 1.1
+attestations — two SBOMs, two VEX statements, SLSA provenance, and a
+vens risk-scoring context document — using [Sigstore
+cosign](https://github.com/sigstore/cosign) keyless signing. There is no key
+to manage or rotate: the signing identity is the GitHub Actions OIDC token
+for the release workflow run.
+
+**Requires cosign >= 3.0.6.** cosign v3.x attaches
+attestations as OCI 1.1 referrers, not the legacy `.sig`/`.att` tag scheme —
+`crane ls` on the image shows only the version tag and the digest tag. An
+older cosign, and some Kyverno / policy-controller configurations expecting
+the legacy tags, report "no signatures found" on an image that is correctly
+signed. Install a current cosign before running the commands below.
+
+Every referrer currently carries the same
+`dev.sigstore.bundle.predicateType: https://sigstore.dev/cosign/sign/v1`
+annotation, including the SBOMs — this is upstream cosign behavior, not
+specific to this project, so do not filter referrers on that annotation.
+Select the one you want with `--type` on `cosign verify-attestation`, as the
+commands below do.
+
+```bash
+UP_ORG=crossplane-contrib
+GITHUB_ORG=crossplane-contrib
+PROJECT_NAME=provider-k3s
+VERSION=vX.Y.Z                     # the release you are verifying
+ISSUER="https://token.actions.githubusercontent.com"
+
+# The repository segment, unlike the org segment, is a naming rule that
+# binds every provider: releases are only ever cut upstream, never from a
+# fork, so the repository's name is always ${PROJECT_NAME} -- read from a
+# recorded rule, not guessed. The identity also stays pinned to the org,
+# the workflow path and the exact tag.
+# VERSION is regexp-escaped before interpolation -- an unescaped '.'
+# is a wildcard that would let a tag differing from VERSION only at a '.'
+# position verify here too.
+VERSION_RE="${VERSION//./\\.}"
+IDENTITY_REGEXP="^https://github\.com/${GITHUB_ORG}/${PROJECT_NAME}/\.github/workflows/release\.yaml@refs/tags/${VERSION_RE}\$"
+IMAGE="xpkg.upbound.io/${UP_ORG}/${PROJECT_NAME}"
+
+DIGEST=$(crane digest "${IMAGE}:${VERSION}")
+SUBJECT="${IMAGE}@${DIGEST}"
+
+# Signature
+cosign verify \
+  --certificate-identity-regexp "$IDENTITY_REGEXP" \
+  --certificate-oidc-issuer "$ISSUER" \
+  "$SUBJECT"
+
+# SBOMs
+cosign verify-attestation --type spdxjson  --certificate-identity-regexp "$IDENTITY_REGEXP" --certificate-oidc-issuer "$ISSUER" "$SUBJECT"
+cosign verify-attestation --type cyclonedx --certificate-identity-regexp "$IDENTITY_REGEXP" --certificate-oidc-issuer "$ISSUER" "$SUBJECT"
+
+# VEX
+cosign verify-attestation --type openvex                    --certificate-identity-regexp "$IDENTITY_REGEXP" --certificate-oidc-issuer "$ISSUER" "$SUBJECT"
+cosign verify-attestation --type https://cyclonedx.org/vex  --certificate-identity-regexp "$IDENTITY_REGEXP" --certificate-oidc-issuer "$ISSUER" "$SUBJECT"
+
+# SLSA provenance
+cosign verify-attestation --type slsaprovenance1 --certificate-identity-regexp "$IDENTITY_REGEXP" --certificate-oidc-issuer "$ISSUER" "$SUBJECT"
+
+# vens risk-scoring context
+cosign verify-attestation --type https://vens.dev/risk-context/v1 --certificate-identity-regexp "$IDENTITY_REGEXP" --certificate-oidc-issuer "$ISSUER" "$SUBJECT"
+```
+
+Or run the whole ladder non-interactively, including the cross-check that
+every attestation's subject digest matches what the tag currently resolves
+to:
+
+```bash
+hack/verify-release.sh vX.Y.Z
+```
+
+### SBOM identity
+
+The Go-module SBOM's `metadata.component.name` is this project's module
+path, `github.com/crossplane-contrib/provider-k3s`. A module path and the
+name of the git repository hosting this project are independent
+identifiers, and are allowed to disagree — this is not a substitution or a
+mismatch: the module path names who publishes this project, while a
+repository name is only a hostname path segment, free to differ from it.
 
 ## Developing
 
