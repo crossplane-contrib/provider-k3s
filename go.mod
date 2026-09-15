@@ -9,7 +9,7 @@ tool github.com/crossplane/crossplane-tools/cmd/angryjet
 require (
 	github.com/alecthomas/kingpin/v2 v2.4.0
 	github.com/crossplane/crossplane-runtime/v2 v2.4.0
-	github.com/crossplane/crossplane/apis/v2 v2.4.0
+	github.com/crossplane/crossplane/apis/v2 v2.4.1
 	github.com/google/go-cmp v0.7.0
 	github.com/pkg/errors v0.9.1
 	golang.org/x/crypto v0.55.0
